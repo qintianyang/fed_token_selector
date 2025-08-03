@@ -11,6 +11,7 @@ import os
 
 from token_selector import TokenSelectorController, WatermarkBitGenerator, GreenListGenerator
 from federated_framework import FederatedClient, FederatedServer, FedAvgAggregator
+from llm_interface import BaseLLMInterface, LLMInterfaceFactory
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -99,15 +100,20 @@ class FederatedTrainer:
     def __init__(self, 
                  config: Dict,
                  num_clients: int = 5,
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 llm_config: Optional[Dict] = None):
         self.config = config
         self.num_clients = num_clients
         self.device = device
+        self.llm_config = llm_config or config.get('llm_config', {})
         
         # 初始化全局模型
         self.global_model = TokenSelectorController(
             vocab_size=config['vocab_size'],
+            context_dim=config.get('context_dim', 768),
             hidden_dim=config['hidden_dim'],
+            num_layers=config.get('num_layers', 3),
+            dropout=config.get('dropout', 0.1),
             top_k=config['top_k']
         ).to(device)
         
@@ -115,7 +121,8 @@ class FederatedTrainer:
         self.aggregator = FedAvgAggregator()
         self.server = FederatedServer(
             global_model=self.global_model,
-            aggregator=self.aggregator
+            aggregator=self.aggregator,
+            config=config
         )
         
         # 初始化客户端
@@ -135,16 +142,61 @@ class FederatedTrainer:
                 collate_fn=collate_fn
             )
             
+            # 为每个客户端创建大模型接口（可选）
+            client_llm_interface = None
+            if self.llm_config.get('enabled', False):
+                try:
+                    interface_type = self.llm_config.get('type', 'huggingface')
+                    
+                    # 根据接口类型提取对应配置
+                    if interface_type == 'huggingface':
+                        hf_config = self.llm_config.get('huggingface', {})
+                        client_llm_interface = LLMInterfaceFactory.create_interface(
+                            'huggingface',
+                            model_name=hf_config.get('model_name', 'gpt2'),
+                            config={
+                                'device': hf_config.get('device', 'auto'),
+                                'cache_dir': hf_config.get('cache_dir', './models')
+                            }
+                        )
+                    elif interface_type == 'openai':
+                        openai_config = self.llm_config.get('openai', {})
+                        client_llm_interface = LLMInterfaceFactory.create_interface(
+                            'openai',
+                            model_name=openai_config.get('model_name', 'gpt-3.5-turbo'),
+                            config={
+                                'api_key': openai_config.get('api_key', ''),
+                                'base_url': openai_config.get('base_url', 'https://api.openai.com/v1'),
+                                'num_samples': openai_config.get('num_samples', 50)
+                            }
+                        )
+                    elif interface_type == 'local':
+                        local_config = self.llm_config.get('local', {})
+                        client_llm_interface = LLMInterfaceFactory.create_interface(
+                            'local',
+                            model_path=local_config.get('model_path', './models/local_model.pth'),
+                            config={
+                                'device': local_config.get('device', 'auto')
+                            }
+                        )
+                    
+                    logger.info(f"客户端 {i} 创建大模型接口成功")
+                except Exception as e:
+                    logger.warning(f"客户端 {i} 大模型接口创建失败: {e}")
+            
             client = FederatedClient(
-                client_id=f"client_{i}",
+                client_id=i,
                 model=TokenSelectorController(
                     vocab_size=config['vocab_size'],
+                    context_dim=config.get('context_dim', 768),  # 添加context_dim参数
                     hidden_dim=config['hidden_dim'],
+                    num_layers=config.get('num_layers', 3),      # 添加num_layers参数
+                    dropout=config.get('dropout', 0.1),          # 添加dropout参数
                     top_k=config['top_k']
                 ).to(device),
-                train_loader=dataloader,
-                optimizer_class=optim.Adam,
-                optimizer_kwargs={'lr': config['learning_rate']}
+                local_data=dataloader,
+                config=config,
+                llm_interface=client_llm_interface
             )
             
             self.clients.append(client)
@@ -156,31 +208,46 @@ class FederatedTrainer:
         )
         
         logger.info(f"初始化联邦训练器: {num_clients}个客户端, 设备: {device}")
+        if self.llm_config.get('enabled', False):
+            logger.info(f"大模型接口: {self.llm_config.get('type', 'huggingface')}")
     
     def train_round(self, round_num: int) -> Dict:
         """执行一轮联邦训练"""
         logger.info(f"开始第 {round_num} 轮联邦训练")
         
-        # 1. 服务器下发全局模型
-        global_state = self.server.get_global_model_state()
+        # 1. 获取全局模型状态
+        global_state = self.server.global_model.state_dict()
         
         # 2. 客户端本地训练
         client_updates = []
+        client_weights = []
         client_metrics = []
         
         for client in self.clients:
-            # 更新客户端模型为全局模型
-            client.update_model(global_state)
-            
             # 本地训练
-            update, metrics = self._train_client(client)
-            client_updates.append(update)
-            client_metrics.append(metrics)
+            model_update = client.local_train(global_state)
+            client_updates.append(model_update)
+            
+            # 客户端权重（基于数据量）
+            client_weight = len(client.local_data.dataset)
+            client_weights.append(client_weight)
+            
+            # 获取训练统计
+            stats = client.get_training_stats()
+            client_metrics.append({
+                'loss': np.mean(stats['total_loss'][-client.local_epochs:]) if stats['total_loss'] else 0.0,
+                'watermark_loss': np.mean(stats['watermark_loss'][-client.local_epochs:]) if stats['watermark_loss'] else 0.0,
+                'semantic_loss': np.mean(stats['semantic_loss'][-client.local_epochs:]) if stats['semantic_loss'] else 0.0,
+                'fluency_loss': np.mean(stats['fluency_loss'][-client.local_epochs:]) if stats['fluency_loss'] else 0.0
+            })
         
-        # 3. 服务器聚合更新
-        self.server.aggregate_updates(client_updates)
+        # 3. 聚合模型更新
+        aggregated_update = self.server.aggregator.aggregate(client_updates, client_weights)
         
-        # 4. 计算平均指标
+        # 4. 更新全局模型
+        self.server._update_global_model(aggregated_update)
+        
+        # 5. 计算平均指标
         avg_metrics = self._average_metrics(client_metrics)
         
         logger.info(f"第 {round_num} 轮完成, 平均损失: {avg_metrics['loss']:.4f}")

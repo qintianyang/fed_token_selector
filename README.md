@@ -11,6 +11,8 @@
 - **多目标优化**：平衡水印强度、语义保持和文本流畅性
 - **统计检测方法**：基于z-score的可靠水印检测
 - **可扩展设计**：支持多种联邦学习算法和水印策略
+- **🆕 真实大模型集成**：支持OpenAI API、HuggingFace模型、本地模型接口
+- **🆕 多接口支持**：统一的大模型接口，支持不同类型的语言模型
 
 ## 🏗️ 系统架构
 
@@ -101,26 +103,41 @@ pip install -r requirements.txt
 
 ### 🎮 运行示例
 
-#### 快速测试
+#### 快速测试（模拟数据）
 ```bash
 cd src
 python demo_complete.py --mode quick
 ```
 
-#### 完整演示
+#### 完整演示（模拟数据）
 ```bash
 cd src
 python demo_complete.py --mode full
-
-
 ```
 
+#### 🆕 使用真实大模型
+```bash
+cd src
+python example_with_llm.py
+```
 
 #### 联邦学习训练
 ```bash
 cd src
 python train_federated.py
 ```
+
+#### 🆕 大模型集成详细指南
+
+查看详细的大模型集成使用指南：
+```bash
+cat LLM_INTEGRATION_README.md
+```
+
+支持的大模型接口：
+- **HuggingFace模型**：本地运行开源模型（推荐用于开发）
+- **OpenAI API**：调用GPT系列模型（需要API密钥）
+- **本地模型**：自定义模型接口
 
 ## 📖 详细使用指南
 
@@ -138,6 +155,28 @@ config = ConfigManager('config/default_config.yaml')
 model_config = config.get_model_config()
 training_config = config.get_training_config()
 federated_config = config.get_federated_config()
+```
+
+#### 🆕 大模型配置
+
+在 `config/default_config.yaml` 中配置大模型接口：
+
+```yaml
+llm_config:
+  enabled: true  # 启用真实大模型
+  type: "huggingface"  # 接口类型
+  
+  # HuggingFace配置
+  huggingface:
+    model_name: "gpt2"
+    device: "auto"
+    cache_dir: "./models"
+  
+  # OpenAI配置
+  openai:
+    model_name: "gpt-3.5-turbo"
+    api_key: "your-api-key-here"
+    base_url: "https://api.openai.com/v1"
 ```
 
 ### 🎯 核心API使用
@@ -162,6 +201,27 @@ logits = torch.randn(batch_size, vocab_size)
 watermark_bits = torch.randint(0, 2, (batch_size,))
 
 token_probs = controller(context_embeddings, logits, watermark_bits)
+```
+
+#### 🆕 大模型接口使用
+
+```python
+from src.llm_interface import LLMInterfaceFactory
+
+# 创建HuggingFace接口
+hf_interface = LLMInterfaceFactory.create_interface(
+    'huggingface',
+    model_name='gpt2',
+    config={'device': 'cpu'}
+)
+
+# 获取logits
+context_tokens = [1, 2, 3, 4, 5]
+logits = hf_interface.get_next_token_logits(context_tokens)
+
+# 生成文本
+response = hf_interface.generate_text("Hello, world!", max_length=20)
+print(f"Generated: {response.text}")
 ```
 
 #### 联邦学习训练

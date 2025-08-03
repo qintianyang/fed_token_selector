@@ -10,7 +10,8 @@ from abc import ABC, abstractmethod
 import json
 import time
 
-from .token_selector import TokenSelectorController, WatermarkBitGenerator, GreenListGenerator
+from token_selector import TokenSelectorController, WatermarkBitGenerator, GreenListGenerator
+from llm_interface import BaseLLMInterface, LLMInterfaceFactory
 
 
 class FederatedClient:
@@ -28,16 +29,33 @@ class FederatedClient:
         client_id: int,
         model: TokenSelectorController,
         local_data: DataLoader,
-        config: Dict[str, Any]
+        config: Dict[str, Any],
+        llm_interface: Optional[BaseLLMInterface] = None
     ):
         self.client_id = client_id
         self.model = model
         self.local_data = local_data
         self.config = config
         
+        # 大模型接口
+        self.llm_interface = llm_interface
+        if self.llm_interface is None:
+            # 如果没有提供LLM接口，创建默认接口
+            llm_config = config.get('llm_config', {})
+            interface_type = llm_config.get('type', 'huggingface')
+            try:
+                self.llm_interface = LLMInterfaceFactory.create_interface(
+                    interface_type, **llm_config
+                )
+                self.logger.info(f"客户端 {client_id} 使用 {interface_type} 大模型接口")
+            except Exception as e:
+                self.logger.warning(f"大模型接口创建失败: {e}，将使用模拟数据")
+                self.llm_interface = None
+        
         # 训练配置
-        self.learning_rate = config.get('learning_rate', 1e-3)
-        self.local_epochs = config.get('local_epochs', 5)
+        training_config = config.get('training', {})
+        self.learning_rate = training_config.get('learning_rate', 1e-3)
+        self.local_epochs = training_config.get('local_epochs', 5)
         self.lambda_watermark = config.get('lambda_watermark', 1.0)
         self.lambda_semantic = config.get('lambda_semantic', 0.5)
         self.lambda_fluency = config.get('lambda_fluency', 0.3)
@@ -109,32 +127,100 @@ class FederatedClient:
         
         return model_update
     
+    def _get_llm_data_for_batch(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        使用大模型获取真实的logits数据
+        
+        Args:
+            batch: 包含context_tokens的批次数据
+            
+        Returns:
+            (context_embedding, top_k_logits, top_k_indices)
+        """
+        context_tokens = batch['context_tokens']  # [batch_size, seq_len]
+        batch_size = context_tokens.size(0)
+        top_k = self.config.get('top_k', 50)
+        
+        context_embeddings = []
+        top_k_logits_list = []
+        top_k_indices_list = []
+        
+        for i in range(batch_size):
+            # 获取单个样本的context tokens
+            sample_tokens = context_tokens[i].tolist()
+            # 移除padding tokens (假设0是padding)
+            sample_tokens = [t for t in sample_tokens if t != 0]
+            
+            if self.llm_interface is not None:
+                try:
+                    # 使用真实大模型获取logits
+                    full_logits = self.llm_interface.get_next_token_logits(sample_tokens)
+                    top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
+                    
+                    # 生成context embedding (简化版本，实际可能需要更复杂的编码)
+                    context_embedding = torch.mean(torch.randn(len(sample_tokens), 768), dim=0)
+                    
+                except Exception as e:
+                    self.logger.warning(f"大模型调用失败: {e}，使用模拟数据")
+                    # 回退到模拟数据
+                    full_logits = torch.randn(self.config.get('vocab_size', 50000))
+                    top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
+                    context_embedding = torch.randn(768)
+            else:
+                # 使用模拟数据
+                full_logits = torch.randn(self.config.get('vocab_size', 50000))
+                top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
+                context_embedding = torch.randn(768)
+            
+            context_embeddings.append(context_embedding)
+            top_k_logits_list.append(top_k_logits)
+            top_k_indices_list.append(top_k_indices)
+        
+        # 堆叠为批次张量
+        context_embedding_batch = torch.stack(context_embeddings)
+        top_k_logits_batch = torch.stack(top_k_logits_list)
+        top_k_indices_batch = torch.stack(top_k_indices_list)
+        
+        return context_embedding_batch, top_k_logits_batch, top_k_indices_batch
+    
     def _train_batch(self, batch: Dict[str, torch.Tensor]) -> float:
         """
         训练单个批次
         
         Args:
-            batch: 包含context_embedding, top_k_logits, top_k_indices, context_tokens
+            batch: 包含context_tokens等的批次数据
             
         Returns:
             loss: 批次损失
         """
         self.optimizer.zero_grad()
         
-        # 解析批次数据
-        context_embedding = batch['context_embedding']  # [batch_size, context_dim]
-        top_k_logits = batch['top_k_logits']           # [batch_size, top_k]
-        top_k_indices = batch['top_k_indices']         # [batch_size, top_k]
-        context_tokens = batch['context_tokens']       # [batch_size, seq_len]
+        # 获取模型设备
+        device = next(self.model.parameters()).device
         
+        # 获取大模型数据
+        if 'context_embedding' in batch and 'top_k_logits' in batch and 'top_k_indices' in batch:
+            # 如果批次中已经包含了预处理的数据，直接使用并移动到正确设备
+            context_embedding = batch['context_embedding'].to(device)
+            top_k_logits = batch['top_k_logits'].to(device)
+            top_k_indices = batch['top_k_indices'].to(device)
+        else:
+            # 否则使用大模型获取数据
+            context_embedding, top_k_logits, top_k_indices = self._get_llm_data_for_batch(batch)
+            # 确保移动到正确设备
+            context_embedding = context_embedding.to(device)
+            top_k_logits = top_k_logits.to(device)
+            top_k_indices = top_k_indices.to(device)
+        
+        context_tokens = batch['context_tokens'].to(device)  # [batch_size, seq_len]
         batch_size = context_embedding.size(0)
         
-        # 生成目标水印比特
+        # 生成目标水印比特并移动到正确设备
         target_bits = self.bit_generator.generate_bits(batch_size)
-        target_bit_tensor = torch.tensor(target_bits, dtype=torch.long)
+        target_bit_tensor = torch.tensor(target_bits, dtype=torch.long, device=device)
         
-        # 生成绿名单mask
-        green_mask = self.greenlist_generator.get_greenlist_mask(context_tokens, top_k_indices)
+        # 生成绿名单mask并移动到正确设备
+        green_mask = self.greenlist_generator.get_greenlist_mask(context_tokens, top_k_indices).to(device)
         
         # 前向传播
         selection_probs, selected_indices = self.model(

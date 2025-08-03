@@ -14,7 +14,7 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import logging
 import json
 import os
@@ -24,6 +24,7 @@ from token_selector import TokenSelectorController, WatermarkBitGenerator, Green
 from federated_framework import FederatedClient, FederatedServer, FedAvgAggregator
 from watermark_detector import WatermarkDetector, WatermarkEvaluator
 from train_federated import WatermarkDataset, FederatedTrainer, collate_fn
+from llm_interface import BaseLLMInterface, LLMInterfaceFactory
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,10 +39,25 @@ class WatermarkTextGenerator:
     def __init__(self, 
                  token_selector: TokenSelectorController,
                  vocab_size: int,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 llm_interface: Optional[BaseLLMInterface] = None,
+                 llm_config: Optional[Dict] = None):
         self.token_selector = token_selector
         self.vocab_size = vocab_size
         self.device = device
+        
+        # 大模型接口
+        self.llm_interface = llm_interface
+        if self.llm_interface is None and llm_config is not None:
+            try:
+                interface_type = llm_config.get('type', 'huggingface')
+                self.llm_interface = LLMInterfaceFactory.create_interface(
+                    interface_type, **llm_config
+                )
+                logger.info(f"文本生成器使用 {interface_type} 大模型接口")
+            except Exception as e:
+                logger.warning(f"大模型接口创建失败: {e}，将使用模拟数据")
+                self.llm_interface = None
         
         # 水印比特生成器
         self.bit_generator = WatermarkBitGenerator()
@@ -79,8 +95,8 @@ class WatermarkTextGenerator:
                 # 获取当前上下文
                 context_tokens = torch.tensor([generated_tokens]).to(self.device)
                 
-                # 模拟大模型输出logits
-                logits = self._simulate_llm_logits(context_tokens)
+                # 获取大模型输出logits
+                logits = self._get_llm_logits(context_tokens)
                 
                 # 获取top-k
                 top_k_logits, top_k_indices = torch.topk(logits, top_k)
@@ -108,13 +124,34 @@ class WatermarkTextGenerator:
         
         return generated_tokens, embedded_bits
     
-    def _simulate_llm_logits(self, context_tokens: torch.Tensor) -> torch.Tensor:
+    def _get_llm_logits(self, context_tokens: torch.Tensor) -> torch.Tensor:
         """
-        模拟大语言模型的logits输出
-        在实际应用中，这里应该调用真实的LLM API
+        获取大语言模型的logits输出
+        优先使用真实的LLM接口，如果不可用则回退到模拟数据
         """
-        # 简单的模拟：基于上下文生成随机但有一定模式的logits
         batch_size, seq_len = context_tokens.shape
+        
+        if self.llm_interface is not None:
+            try:
+                # 转换为token列表（移除batch维度，取第一个样本）
+                token_list = context_tokens[0].tolist()
+                # 移除padding tokens (假设0是padding)
+                token_list = [t for t in token_list if t != 0]
+                
+                # 使用真实大模型获取logits
+                logits = self.llm_interface.get_next_token_logits(token_list)
+                
+                # 确保logits在正确的设备上
+                logits = logits.to(self.device)
+                
+                logger.debug(f"使用真实大模型获取logits，形状: {logits.shape}")
+                return logits
+                
+            except Exception as e:
+                logger.warning(f"大模型调用失败: {e}，回退到模拟数据")
+        
+        # 回退到模拟数据
+        logger.debug("使用模拟logits数据")
         
         # 使用上下文的最后一个token作为种子
         if seq_len > 0:
@@ -129,7 +166,7 @@ class WatermarkTextGenerator:
         high_prob_tokens = torch.randint(0, self.vocab_size, (100,))
         logits[high_prob_tokens] += 1.0
         
-        return logits
+        return logits.to(self.device)
     
     def generate_batch_with_watermark(self, 
                                     prompts: List[List[int]],
