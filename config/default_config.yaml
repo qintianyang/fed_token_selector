@@ -1,0 +1,154 @@
+# 联邦学习Token选择器水印系统配置文件
+
+# 模型配置
+model:
+  vocab_size: 50000
+  hidden_dim: 256
+  top_k: 50
+  num_attention_heads: 8
+  num_transformer_layers: 2
+  dropout: 0.1
+
+# 水印配置
+watermark:
+  gamma: 0.25  # 绿名单比例
+  hash_key: 15485863  # 哈希密钥
+  z_threshold: 4.0  # 检测阈值
+  bit_length: 32  # 水印比特长度
+
+# 联邦学习配置
+federated:
+  num_clients: 10
+  num_rounds: 100
+  client_fraction: 1.0  # 每轮参与的客户端比例
+  aggregation_method: "fedavg"  # fedavg, fedprox, scaffold
+  
+  # FedProx特定参数
+  fedprox:
+    mu: 0.01  # 正则化参数
+
+# 训练配置
+training:
+  learning_rate: 1e-4
+  batch_size: 32
+  local_epochs: 5  # 每个客户端的本地训练轮数
+  samples_per_client: 1000
+  
+  # 损失函数权重
+  loss_weights:
+    watermark: 1.0
+    semantic: 0.5
+    fluency: 0.3
+  
+  # 优化器配置
+  optimizer:
+    type: "adam"
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+  
+  # 学习率调度
+  scheduler:
+    type: "cosine"  # cosine, step, exponential
+    warmup_steps: 100
+    min_lr: 1e-6
+
+# 数据配置
+data:
+  max_seq_len: 128
+  min_seq_len: 10
+  synthetic_data: true  # 是否使用合成数据
+  
+  # 真实数据配置（如果使用）
+  real_data:
+    dataset_name: "c4"  # c4, openwebtext, etc.
+    data_path: "./data"
+    tokenizer_name: "gpt2"
+
+# 评估配置
+evaluation:
+  eval_frequency: 10  # 每多少轮评估一次
+  test_samples: 500
+  metrics:
+    - "watermark_accuracy"
+    - "semantic_similarity"
+    - "fluency_score"
+    - "detection_accuracy"
+    - "false_positive_rate"
+
+# 实验配置
+experiment:
+  name: "federated_watermark_v1"
+  output_dir: "./outputs"
+  save_frequency: 20  # 每多少轮保存一次模型
+  log_level: "INFO"
+  
+  # 随机种子
+  seed: 42
+  
+  # 设备配置
+  device: "auto"  # auto, cpu, cuda
+  mixed_precision: false
+
+# 可视化配置
+visualization:
+  plot_training_curves: true
+  plot_detection_stats: true
+  plot_z_score_distribution: true
+  save_plots: true
+  plot_format: "png"  # png, pdf, svg
+
+# 安全配置
+security:
+  differential_privacy: false
+  dp_noise_multiplier: 1.0
+  dp_max_grad_norm: 1.0
+  
+  # 模型压缩（减少通信开销）
+  model_compression:
+    enabled: false
+    method: "quantization"  # quantization, pruning
+    compression_ratio: 0.5
+
+# 高级配置
+advanced:
+  # 客户端异构性模拟
+  client_heterogeneity:
+    enabled: false
+    data_distribution: "iid"  # iid, non_iid
+    alpha: 0.5  # Dirichlet分布参数（用于non-IID）
+  
+  # 系统异构性
+  system_heterogeneity:
+    enabled: false
+    computation_variance: 0.2
+    communication_variance: 0.1
+  
+  # 拜占庭容错
+  byzantine_robustness:
+    enabled: false
+    byzantine_fraction: 0.1
+    defense_method: "krum"  # krum, trimmed_mean, median
+
+# 扩展实验配置
+extensions:
+  # 联邦蒸馏
+  federated_distillation:
+    enabled: false
+    teacher_model_path: null
+    distillation_temperature: 3.0
+    distillation_weight: 0.5
+  
+  # 联邦对抗训练
+  federated_adversarial:
+    enabled: false
+    adversarial_epsilon: 0.1
+    adversarial_steps: 5
+  
+  # 多任务学习
+  multi_task:
+    enabled: false
+    tasks:
+      - "watermark_embedding"
+      - "text_quality"
+      - "semantic_preservation"
+    task_weights: [1.0, 0.5, 0.5]
