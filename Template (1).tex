@@ -1,0 +1,90 @@
+% Template for ICASSP-2026 paper; to be used with:
+%          spconf.sty  - ICASSP/ICIP LaTeX style file, and
+%          IEEEbib.bst - IEEE bibliography style file.
+% --------------------------------------------------------------------------
+\documentclass{article}
+\usepackage{spconf,amsmath,graphicx,hyperref}
+
+% Example definitions.
+% --------------------
+\def\x{{\mathbf x}}
+\def\L{{\cal L}}
+
+% Title.
+% ------
+\title{AUTHOR GUIDELINES FOR ICASSP 2026 PROCEEDINGS MANUSCRIPTS}
+%
+% Single address.
+% ---------------
+\name{Author(s) Name(s)\thanks{Thanks to XYZ agency for funding.}}
+\address{Author Affiliation(s)}
+%
+% For example:
+% ------------
+%\address{School\\
+%	Department\\
+%	Address}
+%
+% Two addresses (uncomment and modify for two-address case).
+% ----------------------------------------------------------
+%\twoauthors
+%  {A. Author-one, B. Author-two\sthanks{Thanks to XYZ agency for funding.}}
+%	{School A-B\\
+%	Department A-B\\
+%	Address A-B}
+%  {C. Author-three, D. Author-four\sthanks{The fourth author performed the work
+%	while at ...}}
+%	{School C-D\\
+%	Department C-D\\
+%	Address C-D}
+%
+\begin{document}
+%\ninept
+%
+\maketitle
+%
+\begin{abstract}
+The abstract should appear at the top of the left-hand column of text, about
+0.5 inch (12 mm) below the title area and no more than 3.125 inches (80 mm) in
+length.  Leave a 0.5 inch (12 mm) space between the end of the abstract and the
+beginning of the main text.  The abstract should contain about 100 to 150
+words, and should be identical to the abstract text submitted electronically
+along with the paper cover sheet.  All manuscripts must be in English, printed
+in black ink.
+\end{abstract}
+%
+\begin{keywords}
+One, two, three, four, five
+\end{keywords}
+%
+\section{Introduction}
+\label{sec:intro}With the rapid advancement of large language models (LLMs) such as GPT, LLaMA, and PaLM, the distinction between machine-generated and human-written text is becoming increasingly blurred. This trend raises critical concerns, including the spread of misinformation, infringement of intellectual property rights, and misuse of AI-generated content. To address these challenges, text watermarking has emerged as a promising technique. By embedding imperceptible signals into generated text, watermarking enables source attribution and ownership verification, and has become a research hotspot in the field.
+
+Current watermarking methods for LLMs can be broadly categorized into two main types: vocabulary-constrained strategies and sampling perturbation strategies. The former is exemplified by the green-red token partitioning mechanism, such as the KGW method proposed by Kirchenbauer et al.~\cite{kirchenbauer2023watermark}, which divides the vocabulary at each decoding step into green and red lists and restricts token sampling to the green list. This introduces detectable statistical deviations in token distributions. However, such methods often struggle in low-entropy or context-constrained settings, where rigid constraints can severely impact fluency and semantic integrity. Later improvements, such as those proposed by Zhao et al., use fixed greenlists to enhance robustness against editing and paraphrasing. While this alleviates some issues, it still suffers from limited generality and potential degradation in generation quality.
+
+In contrast, sampling perturbation methods embed watermarks through lightweight modifications of the sampling process without significantly altering the underlying probability distribution, thus offering stronger imperceptibility and output naturalness. A representative example is DeepMind’s SynthID-Text~\cite{deepmind2023synthid}, which employs a tournament sampling mechanism: a small model generates candidate sequences, and a large model selects the output tokens through a seed-guided scoring function. This approach embeds watermarks subtly and avoids directly manipulating the logits. Meanwhile, theoretical work has shown that under certain adversarial conditions, perfectly undetectable watermarks may be theoretically impossible~\cite{christ2023undetectable}, posing additional challenges for deployment and legal reliability.
+
+Despite progress in both detectability and stealth, existing watermarking methods face several practical limitations. Most approaches are tightly coupled with the internal decoding process of the language model, often requiring access to model parameters or custom fine-tuning. This deep integration restricts portability and complicates deployment in closed or commercial systems. Moreover, current methods generally lack strong generalization capability, as they are typically designed and optimized for specific model architectures or domains, limiting their effectiveness across diverse settings. Additionally, many methods rely on static rules---such as fixed greenlists or predefined sampling constraints---which are difficult to adapt to dynamic generation contexts. This leads to poor flexibility when dealing with diverse writing styles, varying entropy levels, or user-defined constraints. Together, these limitations significantly hinder the scalability, robustness, and universality of existing watermarking techniques.
+
+To overcome these challenges, we propose a \textit{federated token selection controller}, a lightweight and pluggable external module that enables watermark embedding by controlling token selection from a top-$k$ logits distribution. Unlike previous methods that require modifications to the language model itself, our controller operates independently and makes step-wise decisions based on contextual embeddings, target watermark bits, and candidate token scores. Furthermore, to enhance cross-domain adaptability and deployment flexibility, we adopt a federated learning framework to collaboratively train the controller across multiple clients. Each client may possess distinct data distributions or LLM interfaces, and the decentralized training process preserves data privacy while promoting generalization. This design enables scalable deployment without requiring access to raw data or internal model parameters.
+
+The paper’s contributions can be summarized concisely as follows: 1) We propose a novel watermarking framework based on a trainable token selection controller that operates independently of the internal structure of LLMs; 2) We design a federated training protocol that enables cross-client collaborative optimization while preserving data privacy, thereby enhancing cross-domain robustness; 3) We validate our method on both synthetic and real large-model generated texts, demonstrating superior performance and stronger adaptability compared to existing mainstream watermarking techniques.
+
+
+\section{Methodology}
+\label{sec:method}
+\subsection{Overview}
+We propose a \textbf{federated learning-based trainable external token selection controller} (denoted as \( \mathcal{C} \)) for text watermarking, designed to embed high-quality and verifiable watermarks without interfering with the internal structure or parameters of the host large language models (LLMs). The controller selects output tokens dynamically from a set of candidates generated by a collection of heterogeneous host models \( \{\text{LLM}_1, \text{LLM}_2, \ldots, \text{LLM}_M\} \). The resulting output sequence must satisfy two key objectives: (1) maintaining semantic consistency with the original output distribution of the host LLM to ensure naturalness and fluency of the text, and (2) embedding a target binary watermark bitstream \( \mathbf{b} = \{b_1, b_2, \ldots, b_T\} \in \{0,1\}^T \), which can be accurately recovered in the post-hoc verification stage via a dedicated decoder \( \mathcal{D} \). 
+ 
+ The controller \( \mathcal{C} \) is trained in a standard federated learning environment consisting of \( N \) clients \( \{\mathcal{Client}_1, \mathcal{Client}_2, \ldots, \mathcal{Client}_N\} \) and a central server \( \mathcal{S} \). Each client is equipped with a local host model \( \text{LLM}_i \) and maintains a local replica \( \mathcal{C}_i \) of the controller. Throughout the training process, no client shares raw data (e.g., prompts or generated texts), host model parameters, or user-specific information with the server or other clients. Instead, the global controller \( \mathcal{C}_{\text{global}} \) is progressively optimized via aggregation of updates from local controllers on the central server, enabling generalization across heterogeneous architectures and non-i.i.d. data distributions. 
+ 
+ The overall workflow consists of two stages: \textbf{federated training} and \textbf{watermark generation}. During the training phase, the server distributes the current controller parameters to selected clients. Each client trains the controller based on local context and top-\(k\) token candidates (from the host LLM’s logits distribution), learning to embed the specified watermark bits while preserving semantic naturalness. After local updates, the modified controller parameters are uploaded and aggregated to update the global model. In the watermark generation phase, the trained controller is deployed alongside the host LLM. At each generation step, the host model outputs candidate token distributions, and the controller selects the final output token based on the current context and target watermark bit. This achieves a balance between effective watermark embedding and high text quality. The embedded watermark can be accurately extracted by a decoder \( \mathcal{D} \) during post-hoc verification.This decoupled architecture provides strong model compatibility and deployment flexibility, enabling watermark injection without access to or modification of host LLM internals, making it suitable for a wide range of pre-trained models and real-world federated deployments. 
+
+
+\section{REFERENCES}
+\label{sec:refs}
+
+\bibliographystyle{IEEEbib}
+\bibliography{strings,refs}
+
+\end{document}

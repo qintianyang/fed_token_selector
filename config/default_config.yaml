@@ -4,7 +4,8 @@
 model:
   vocab_size: 50000
   hidden_dim: 256
-  top_k: 50
+  top_p: 0.92
+  max_candidate_tokens: 50
   num_attention_heads: 8
   num_transformer_layers: 2
   dropout: 0.1
@@ -18,8 +19,8 @@ watermark:
 
 # 联邦学习配置
 federated:
-  num_clients: 10
-  num_rounds: 100
+  num_clients: 2
+  num_rounds: 1
   client_fraction: 1.0  # 每轮参与的客户端比例
   aggregation_method: "fedavg"  # fedavg, fedprox, scaffold
   
@@ -31,7 +32,7 @@ federated:
 training:
   learning_rate: 1e-4
   batch_size: 32
-  local_epochs: 5  # 每个客户端的本地训练轮数
+  local_epochs: 1  # 每个客户端的本地训练轮数
   samples_per_client: 1000
   
   # 损失函数权重
