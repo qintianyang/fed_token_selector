@@ -42,7 +42,7 @@ class WatermarkTextGenerator:
                  device: str = 'cpu',
                  llm_interface: Optional[BaseLLMInterface] = None,
                  llm_config: Optional[Dict] = None):
-        self.token_selector = token_selector
+        self.token_selector = token_selector.to(device)
         self.vocab_size = vocab_size
         self.device = device
         
@@ -50,11 +50,16 @@ class WatermarkTextGenerator:
         self.llm_interface = llm_interface
         if self.llm_interface is None and llm_config is not None:
             try:
+                # 确保LLM接口使用与生成器相同的设备
+                if 'config' not in llm_config:
+                    llm_config['config'] = {}
+                llm_config['config']['device'] = self.device
+
                 interface_type = llm_config.get('type', 'huggingface')
                 self.llm_interface = LLMInterfaceFactory.create_interface(
                     interface_type, **llm_config
                 )
-                logger.info(f"文本生成器使用 {interface_type} 大模型接口")
+                logger.info(f"文本生成器使用 {interface_type} 大模型接口，设备: {self.device}")
             except Exception as e:
                 logger.warning(f"大模型接口创建失败: {e}，将使用模拟数据")
                 self.llm_interface = None
@@ -103,14 +108,17 @@ class WatermarkTextGenerator:
                 
                 # 获取当前要嵌入的比特
                 current_bit_idx = step % len(watermark_bits)
-                target_bit = torch.tensor([watermark_bits[current_bit_idx]]).float().to(self.device)
+                target_bit = torch.tensor([watermark_bits[current_bit_idx]]).long().to(self.device)
+
+                # 获取上下文嵌入
+                context_embedding = self._get_context_embedding(context_tokens)
                 
                 # 使用token选择器选择token
                 selection_probs, selected_indices = self.token_selector(
-                    context_tokens, 
-                    top_k_logits.unsqueeze(0), 
-                    top_k_indices.unsqueeze(0), 
-                    target_bit
+                    context_embedding.unsqueeze(0),  # [1, context_dim]
+                    top_k_logits.unsqueeze(0),      # [1, top_k]
+                    target_bit,                     # [1]
+                    top_k_indices.unsqueeze(0)      # [1, top_k]
                 )
                 
                 # 选择token
@@ -123,6 +131,24 @@ class WatermarkTextGenerator:
                     break
         
         return generated_tokens, embedded_bits
+
+    def _get_context_embedding(self, context_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        获取上下文的嵌入表示
+        优先使用真实的LLM接口，如果不可用则回退到模拟数据
+        """
+        if self.llm_interface is not None:
+            try:
+                token_list = context_tokens[0].tolist()
+                token_list = [t for t in token_list if t != 0]
+                embedding = self.llm_interface.get_context_embedding(token_list)
+                return embedding.to(self.device)
+            except Exception as e:
+                logger.warning(f"获取上下文嵌入失败: {e}，回退到模拟数据")
+        
+        # 回退到模拟数据
+        logger.debug("使用模拟上下文嵌入")
+        return torch.randn(self.token_selector.context_dim).to(self.device)
     
     def _get_llm_logits(self, context_tokens: torch.Tensor) -> torch.Tensor:
         """

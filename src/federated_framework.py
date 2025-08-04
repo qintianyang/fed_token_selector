@@ -36,6 +36,9 @@ class FederatedClient:
         self.model = model
         self.local_data = local_data
         self.config = config
+    
+        # 日志
+        self.logger = logging.getLogger(f'Client_{client_id}')
         
         # 大模型接口
         self.llm_interface = llm_interface
@@ -55,7 +58,7 @@ class FederatedClient:
         # 训练配置
         training_config = config.get('training', {})
         self.learning_rate = training_config.get('learning_rate', 1e-3)
-        self.local_epochs = training_config.get('local_epochs', 5)
+        self.local_epochs = training_config.get('local_epochs', 2)
         self.lambda_watermark = config.get('lambda_watermark', 1.0)
         self.lambda_semantic = config.get('lambda_semantic', 0.5)
         self.lambda_fluency = config.get('lambda_fluency', 0.3)
@@ -69,9 +72,6 @@ class FederatedClient:
             vocab_size=config.get('vocab_size', 50000),
             gamma=config.get('gamma', 0.25)
         )
-        
-        # 日志
-        self.logger = logging.getLogger(f'Client_{client_id}')
         
         # 训练统计
         self.training_stats = {
@@ -151,26 +151,29 @@ class FederatedClient:
             # 移除padding tokens (假设0是padding)
             sample_tokens = [t for t in sample_tokens if t != 0]
             
+            # 获取模型期望的context_dim
+            expected_context_dim = self.model.context_dim
+        
             if self.llm_interface is not None:
                 try:
                     # 使用真实大模型获取logits
                     full_logits = self.llm_interface.get_next_token_logits(sample_tokens)
                     top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
                     
-                    # 生成context embedding (简化版本，实际可能需要更复杂的编码)
-                    context_embedding = torch.mean(torch.randn(len(sample_tokens), 768), dim=0)
+                    # 使用LLM接口获取有意义的上下文嵌入
+                    context_embedding = self.llm_interface.get_context_embedding(sample_tokens)
                     
                 except Exception as e:
-                    self.logger.warning(f"大模型调用失败: {e}，使用模拟数据")
+                    self.logger.warning(f"使用LLM接口获取数据时出错: {e}，将回退到模拟数据")
                     # 回退到模拟数据
                     full_logits = torch.randn(self.config.get('vocab_size', 50000))
                     top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
-                    context_embedding = torch.randn(768)
+                    context_embedding = torch.randn(expected_context_dim)
             else:
                 # 使用模拟数据
                 full_logits = torch.randn(self.config.get('vocab_size', 50000))
                 top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
-                context_embedding = torch.randn(768)
+                context_embedding = torch.randn(expected_context_dim)
             
             context_embeddings.append(context_embedding)
             top_k_logits_list.append(top_k_logits)
@@ -219,8 +222,10 @@ class FederatedClient:
         target_bits = self.bit_generator.generate_bits(batch_size)
         target_bit_tensor = torch.tensor(target_bits, dtype=torch.long, device=device)
         
-        # 生成绿名单mask并移动到正确设备
-        green_mask = self.greenlist_generator.get_greenlist_mask(context_tokens, top_k_indices).to(device)
+        # 生成绿名单mask并确保在正确设备上
+        green_mask = self.greenlist_generator.get_greenlist_mask(context_tokens, top_k_indices)
+        # 双重保险：确保green_mask在正确设备上
+        green_mask = green_mask.to(device)
         
         # 前向传播
         selection_probs, selected_indices = self.model(

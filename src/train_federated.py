@@ -107,10 +107,16 @@ class FederatedTrainer:
         self.device = device
         self.llm_config = llm_config or config.get('llm_config', {})
         
+        # 动态获取context_dim
+        context_dim = self._get_llm_embedding_dim()
+        if context_dim is None:
+            context_dim = config.get('context_dim', 768) # Fallback
+            logger.warning(f"无法从LLM动态获取embedding_dim，使用默认值: {context_dim}")
+
         # 初始化全局模型
         self.global_model = TokenSelectorController(
             vocab_size=config['vocab_size'],
-            context_dim=config.get('context_dim', 768),
+            context_dim=context_dim, # 使用动态获取的维度
             hidden_dim=config['hidden_dim'],
             num_layers=config.get('num_layers', 3),
             dropout=config.get('dropout', 0.1),
@@ -151,11 +157,16 @@ class FederatedTrainer:
                     # 根据接口类型提取对应配置
                     if interface_type == 'huggingface':
                         hf_config = self.llm_config.get('huggingface', {})
+                        # 解析 'auto' 设备
+                        llm_device = hf_config.get('device', 'auto')
+                        if llm_device == 'auto':
+                            llm_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                    
                         client_llm_interface = LLMInterfaceFactory.create_interface(
-                            'huggingface',
+                            interface_type='huggingface',
                             model_name=hf_config.get('model_name', 'gpt2'),
                             config={
-                                'device': hf_config.get('device', 'auto'),
+                                'device': llm_device,
                                 'cache_dir': hf_config.get('cache_dir', './models')
                             }
                         )
@@ -188,29 +199,38 @@ class FederatedTrainer:
                 client_id=i,
                 model=TokenSelectorController(
                     vocab_size=config['vocab_size'],
-                    context_dim=config.get('context_dim', 768),  # 添加context_dim参数
+                    context_dim=context_dim,  # 使用动态获取的维度
                     hidden_dim=config['hidden_dim'],
-                    num_layers=config.get('num_layers', 3),      # 添加num_layers参数
-                    dropout=config.get('dropout', 0.1),          # 添加dropout参数
+                    num_layers=config.get('num_layers', 3),      
+                    dropout=config.get('dropout', 0.1),          
                     top_k=config['top_k']
                 ).to(device),
                 local_data=dataloader,
                 config=config,
                 llm_interface=client_llm_interface
             )
-            
             self.clients.append(client)
-        
-        # 绿名单生成器
-        self.green_generator = GreenListGenerator(
-            vocab_size=config['vocab_size'],
-            gamma=config['gamma']
-        )
-        
-        logger.info(f"初始化联邦训练器: {num_clients}个客户端, 设备: {device}")
-        if self.llm_config.get('enabled', False):
-            logger.info(f"大模型接口: {self.llm_config.get('type', 'huggingface')}")
-    
+
+    def _get_llm_embedding_dim(self) -> Optional[int]:
+        """尝试创建一个临时的LLM接口来获取嵌入维度"""
+        if not self.llm_config.get('enabled', False):
+            return None
+        try:
+            interface_type = self.llm_config.get('type', 'huggingface')
+            temp_interface = LLMInterfaceFactory.create_interface(
+                interface_type,
+                **self.llm_config.get(interface_type, {})
+            )
+            if hasattr(temp_interface, 'get_embedding_dim'):
+                dim = temp_interface.get_embedding_dim()
+                logger.info(f"从 {interface_type} 接口动态获取的 embedding_dim: {dim}")
+                return dim
+            # 临时的接口使用后可以考虑销毁，如果它占用了大量资源
+            del temp_interface
+        except Exception as e:
+            logger.error(f"创建临时LLM接口以获取embedding_dim失败: {e}")
+        return None
+
     def train_round(self, round_num: int) -> Dict:
         """执行一轮联邦训练"""
         logger.info(f"开始第 {round_num} 轮联邦训练")
@@ -250,7 +270,12 @@ class FederatedTrainer:
         # 5. 计算平均指标
         avg_metrics = self._average_metrics(client_metrics)
         
-        logger.info(f"第 {round_num} 轮完成, 平均损失: {avg_metrics['loss']:.4f}")
+        # 打印详细的训练指标
+        logger.info(f"第 {round_num} 轮完成:")
+        logger.info(f"  总损失: {avg_metrics['loss']:.4f}")
+        logger.info(f"  水印损失: {avg_metrics['watermark_loss']:.4f}")
+        logger.info(f"  语义损失: {avg_metrics['semantic_loss']:.4f}")
+        logger.info(f"  流畅性损失: {avg_metrics['fluency_loss']:.4f}")
         
         return avg_metrics
     
@@ -440,8 +465,15 @@ def main():
     # 创建输出目录
     os.makedirs('outputs', exist_ok=True)
     
-    # 初始化训练器
-    trainer = FederatedTrainer(config, num_clients=5)
+    # 创建训练结果记录文件
+    from datetime import datetime
+    results_file = 'outputs/federated_training_results.txt'
+    with open(results_file, 'w', encoding='utf-8') as f:
+        f.write("联邦学习训练结果记录\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"总轮数: {config['num_rounds']}\n")
+        f.write("\n")
     
     # 训练循环
     training_history = []
@@ -451,14 +483,33 @@ def main():
         metrics = trainer.train_round(round_num)
         training_history.append(metrics)
         
+        # 保存每轮的模型
+        model_path = f'outputs/federated_model_round_{round_num}.pth'
+        trainer.save_model(model_path)
+        logger.info(f"第 {round_num} 轮模型已保存到: {model_path}")
+        
+        # 将结果追加到txt文件
+        with open(results_file, 'a', encoding='utf-8') as f:
+            f.write(f"第 {round_num} 轮训练结果:\n")
+            f.write(f"  总损失: {metrics['loss']:.6f}\n")
+            f.write(f"  水印损失: {metrics['watermark_loss']:.6f}\n")
+            f.write(f"  语义损失: {metrics['semantic_loss']:.6f}\n")
+            f.write(f"  流畅性损失: {metrics['fluency_loss']:.6f}\n")
+            f.write(f"  模型保存路径: {model_path}\n")
+            f.write(f"  完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("-" * 30 + "\n")
+        
         # 每10轮评估一次
         if round_num % 10 == 0:
             eval_metrics = trainer.evaluate()
             logger.info(f"评估结果 - 测试损失: {eval_metrics['test_loss']:.4f}, "
                        f"水印准确率: {eval_metrics['watermark_accuracy']:.4f}")
             
-            # 保存模型
-            trainer.save_model(f'outputs/federated_model_round_{round_num}.pth')
+            # 记录评估结果
+            with open(results_file, 'a', encoding='utf-8') as f:
+                f.write(f"  评估结果:\n")
+                f.write(f"    测试损失: {eval_metrics['test_loss']:.6f}\n")
+                f.write(f"    水印准确率: {eval_metrics['watermark_accuracy']:.6f}\n")
     
     # 保存训练历史
     with open('outputs/training_history.json', 'w') as f:

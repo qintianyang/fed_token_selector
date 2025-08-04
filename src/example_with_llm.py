@@ -11,7 +11,9 @@
 import torch
 import logging
 import yaml
+import os  # 添加这行
 from pathlib import Path
+from datetime import datetime  # 添加这行
 
 from llm_interface import LLMInterfaceFactory
 from token_selector import TokenSelectorController
@@ -72,37 +74,41 @@ def test_llm_interfaces():
     except Exception as e:
         logger.error(f"OpenAI接口测试失败: {e}")
 
+# 在文件开头添加 os 导入
+import os
+
+# 在 run_federated_training_with_llm 函数中，保存模型之前添加：
 def run_federated_training_with_llm():
     """使用YAML配置文件的联邦训练示例"""
     # 从YAML加载配置
     config = load_config_from_yaml()
     
-    if config is None:
-        # 如果YAML加载失败，使用硬编码配置作为备选
-        config = {
-            'vocab_size': 50257,
-            'hidden_dim': 256,
-            'top_k': 50,
-            'gamma': 0.25,
-            'learning_rate': 1e-4,
-            'batch_size': 4,  # 较小的批次大小以减少计算量
-            'samples_per_client': 50,  # 较少的样本数以加快演示
-            'num_rounds': 5,  # 较少的轮数
-            'lambda_watermark': 1.0,
-            'lambda_semantic': 0.5,
-            'lambda_fluency': 0.3,
+    # if config is None:
+    #     # 如果YAML加载失败，使用硬编码配置作为备选
+    #     config = {
+    #         'vocab_size': 50257,
+    #         'hidden_dim': 256,
+    #         'top_k': 50,
+    #         'gamma': 0.25,
+    #         'learning_rate': 1e-4,
+    #         'batch_size': 4,  # 较小的批次大小以减少计算量
+    #         'samples_per_client': 50,  # 较少的样本数以加快演示
+    #         'num_rounds': 5,  # 较少的轮数
+    #         'lambda_watermark': 1.0,
+    #         'lambda_semantic': 0.5,
+    #         'lambda_fluency': 0.3,
             
-            # 大模型配置
-            'llm_config': {
-                'enabled': True,
-                'type': 'huggingface',
-                'huggingface': {  # ✅ 正确：按接口类型分组配置
-                    'model_name': 'meta-llama/Llama-3.2-1B',
-                    'device': 'cuda',  # ✅ 正确：直接使用device
-                    'cache_dir': '/home/qty/code/llama'  # 可选：模型缓存目录
-                }
-            }
-        }
+    #         # 大模型配置
+    #         'llm_config': {
+    #             'enabled': True,
+    #             'type': 'huggingface',
+    #             'huggingface': {  # ✅ 正确：按接口类型分组配置
+    #                 'model_name': 'meta-llama/Llama-3.2-1B',
+    #                 'device': 'cuda',  # ✅ 正确：直接使用device
+    #                 'cache_dir': '/home/qty/code/llama'  # 可选：模型缓存目录
+    #             }
+    #         }
+    #     }
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.info(f"使用设备: {device}")
@@ -111,16 +117,63 @@ def run_federated_training_with_llm():
     # 创建联邦训练器
     trainer = FederatedTrainer(
         config=config,
-        num_clients=2,  # 较少的客户端数量
+        num_clients=config['num_clients'],  # 修改：直接访问扁平化后的配置
         device=device,
         llm_config=config['llm_config']
     )
     
     # 运行几轮训练
+    # 创建输出目录
+    import os
+    os.makedirs('outputs', exist_ok=True)
+    
+    # 创建训练结果记录文件
+    results_file = 'outputs/training_results.txt'
+    with open(results_file, 'w', encoding='utf-8') as f:
+        f.write("联邦学习训练结果记录\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"总轮数: {config['num_rounds']}\n")
+        f.write(f"客户端数量: {config['num_clients']}\n")
+        f.write("\n")
+    
+    # 运行训练循环
     for round_num in range(1, config['num_rounds'] + 1):
         logger.info(f"开始第 {round_num} 轮训练")
         metrics = trainer.train_round(round_num)
-        logger.info(f"第 {round_num} 轮完成，平均损失: {metrics['loss']:.4f}")
+        
+        # 打印详细的训练指标
+        logger.info(f"第 {round_num} 轮训练完成:")
+        logger.info(f"  总损失: {metrics['loss']:.4f}")
+        logger.info(f"  水印损失: {metrics['watermark_loss']:.4f}")
+        logger.info(f"  语义损失: {metrics['semantic_loss']:.4f}")
+        logger.info(f"  流畅性损失: {metrics['fluency_loss']:.4f}")
+        
+        # 保存每轮的模型
+        model_path = f'outputs/model_round_{round_num}.pth'
+        # 确保目录存在（双重保险）
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        trainer.save_model(model_path)
+        logger.info(f"第 {round_num} 轮模型已保存到: {model_path}")
+        
+        # 将结果追加到txt文件
+        with open(results_file, 'a', encoding='utf-8') as f:
+            f.write(f"第 {round_num} 轮训练结果:\n")
+            f.write(f"  总损失: {metrics['loss']:.6f}\n")
+            f.write(f"  水印损失: {metrics['watermark_loss']:.6f}\n")
+            f.write(f"  语义损失: {metrics['semantic_loss']:.6f}\n")
+            f.write(f"  流畅性损失: {metrics['fluency_loss']:.6f}\n")
+            f.write(f"  模型保存路径: {model_path}\n")
+            f.write(f"  完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("-" * 30 + "\n")
+    
+    # 记录训练完成信息
+    with open(results_file, 'a', encoding='utf-8') as f:
+        f.write(f"\n训练完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 50 + "\n")
+    
+    logger.info(f"训练结果已保存到: {results_file}")
+    logger.info(f"第 {round_num} 轮完成，平均损失: {metrics['loss']:.4f}")
     
     # 保存训练好的模型
     model_path = 'trained_model_with_llm.pth'
@@ -142,19 +195,20 @@ def test_watermark_generation_with_llm(model):
         return
     
     try:
-        # 创建大模型接口
-        llm_config = {
-            'type': 'huggingface',
-            'model_name': 'gpt2',
-            'config': {'device': 'cpu'}
-        }
-        
-        # 创建文本生成器
+        # 自动检测可用设备
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        logger.info(f"水印生成测试使用设备: {device}")
+
+        # 创建文本生成器，统一使用检测到的设备
         generator = WatermarkTextGenerator(
             token_selector=model,
-            vocab_size=50257,
-            device='cpu',
-            llm_config=llm_config
+            vocab_size=50257, # GPT-2/Llama vocab size
+            device=device,
+            llm_config={
+                'type': 'huggingface',
+                'model_name': 'meta-llama/Llama-3.2-1B',
+                # 'config'中的device将由WatermarkTextGenerator内部设置，此处可省略
+            }
         )
         
         # 生成带水印的文本
@@ -233,25 +287,25 @@ def main():
     
     # 2. 尝试从配置文件加载配置
     config = load_config_from_yaml()
-    if config is None:
-        logger.info("使用默认配置")
-        # 使用简化的默认配置进行快速测试
-        config = {
-            'vocab_size': 1000,  # 较小的词汇表用于快速测试
-            'hidden_dim': 64,
-            'top_k': 20,
-            'gamma': 0.25,
-            'learning_rate': 1e-3,
-            'batch_size': 2,
-            'samples_per_client': 10,
-            'num_rounds': 2,
-            'lambda_watermark': 1.0,
-            'lambda_semantic': 0.5,
-            'lambda_fluency': 0.3,
-            'llm_config': {
-                'enabled': False  # 在快速测试中禁用真实大模型
-            }
-        }
+    # if config is None:
+    #     logger.info("使用默认配置")
+    #     # 使用简化的默认配置进行快速测试
+    #     config = {
+    #         'vocab_size': 1000,  # 较小的词汇表用于快速测试
+    #         'hidden_dim': 64,
+    #         'top_k': 20,
+    #         'gamma': 0.25,
+    #         'learning_rate': 1e-3,
+    #         'batch_size': 2,
+    #         'samples_per_client': 10,
+    #         'num_rounds': 2,
+    #         'lambda_watermark': 1.0,
+    #         'lambda_semantic': 0.5,
+    #         'lambda_fluency': 0.3,
+    #         'llm_config': {
+    #             'enabled': False  # 在快速测试中禁用真实大模型
+    #         }
+    #     }
     
     # 3. 运行联邦学习训练
     trained_model = run_federated_training_with_llm()

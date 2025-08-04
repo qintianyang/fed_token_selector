@@ -214,6 +214,38 @@ class WatermarkBitGenerator:
         self.position += length
         return bits
     
+    def message_to_bits(self, message: str) -> List[int]:
+        """将字符串消息转换为比特序列"""
+        # 将字符串转换为字节，再转换为比特
+        message_bytes = message.encode('utf-8')
+        bits = []
+        for byte in message_bytes:
+            # 将每个字节转换为8个比特
+            for i in range(8):
+                bits.append((byte >> (7 - i)) & 1)
+        return bits
+    
+    def bits_to_message(self, bits: List[int]) -> str:
+        """将比特序列转换回字符串消息"""
+        # 确保比特数量是8的倍数
+        if len(bits) % 8 != 0:
+            # 填充到8的倍数
+            bits = bits + [0] * (8 - len(bits) % 8)
+        
+        message_bytes = []
+        for i in range(0, len(bits), 8):
+            byte_bits = bits[i:i+8]
+            byte_value = 0
+            for j, bit in enumerate(byte_bits):
+                byte_value |= (bit << (7 - j))
+            message_bytes.append(byte_value)
+        
+        try:
+            return bytes(message_bytes).decode('utf-8')
+        except UnicodeDecodeError:
+            # 如果解码失败，返回十六进制表示
+            return bytes(message_bytes).hex()
+    
     def reset(self):
         """重置位置"""
         self.position = 0
@@ -242,7 +274,9 @@ class GreenListGenerator:
             green_mask: [batch_size, top_k] - 1表示绿名单token，0表示非绿名单
         """
         batch_size, top_k = top_k_indices.shape
-        green_mask = torch.zeros_like(top_k_indices, dtype=torch.float)
+        # 确保green_mask在与输入张量相同的设备上
+        device = top_k_indices.device
+        green_mask = torch.zeros_like(top_k_indices, dtype=torch.float, device=device)
         
         for b_idx in range(batch_size):
             # 基于上下文最后一个token生成种子
@@ -251,10 +285,10 @@ class GreenListGenerator:
             else:
                 seed = self.hash_key
             
-            # 生成绿名单
-            rng = torch.Generator()
+            # 生成绿名单 - 确保在正确设备上
+            rng = torch.Generator(device=device)
             rng.manual_seed(seed)
-            vocab_permutation = torch.randperm(self.vocab_size, generator=rng)
+            vocab_permutation = torch.randperm(self.vocab_size, generator=rng, device=device)
             greenlist_ids = vocab_permutation[:self.greenlist_size]
             
             # 检查top_k中哪些是绿名单
