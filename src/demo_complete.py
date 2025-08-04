@@ -76,7 +76,8 @@ class WatermarkTextGenerator:
                                    prompt_tokens: List[int],
                                    max_length: int = 50,
                                    watermark_message: str = "SECRET",
-                                   top_k: int = 50) -> Tuple[List[int], List[int]]:
+                                   top_p: float = 0.92, 
+                                   max_candidate_tokens: int = 50) -> Tuple[List[int], List[int]]:
         """
         生成带水印的文本
         
@@ -84,7 +85,8 @@ class WatermarkTextGenerator:
             prompt_tokens: 初始prompt的token序列
             max_length: 最大生成长度
             watermark_message: 要嵌入的水印消息
-            top_k: top-k采样参数
+            top_p: top-p采样参数
+            max_candidate_tokens: top-p采样后的最大候选token数
             
         Returns:
             (生成的token序列, 嵌入的比特序列)
@@ -103,8 +105,10 @@ class WatermarkTextGenerator:
                 # 获取大模型输出logits
                 logits = self._get_llm_logits(context_tokens)
                 
-                # 获取top-k
-                top_k_logits, top_k_indices = torch.topk(logits, top_k)
+                # 应用Top-p (nucleus) 采样
+                top_p_logits, top_p_indices = self._nucleus_sampling(
+                    logits, top_p, max_candidate_tokens
+                )
                 
                 # 获取当前要嵌入的比特
                 current_bit_idx = step % len(watermark_bits)
@@ -116,9 +120,9 @@ class WatermarkTextGenerator:
                 # 使用token选择器选择token
                 selection_probs, selected_indices = self.token_selector(
                     context_embedding.unsqueeze(0),  # [1, context_dim]
-                    top_k_logits.unsqueeze(0),      # [1, top_k]
+                    top_p_logits.unsqueeze(0),      # [1, max_candidate_tokens]
                     target_bit,                     # [1]
-                    top_k_indices.unsqueeze(0)      # [1, top_k]
+                    top_p_indices.unsqueeze(0)      # [1, max_candidate_tokens]
                 )
                 
                 # 选择token
@@ -131,6 +135,27 @@ class WatermarkTextGenerator:
                     break
         
         return generated_tokens, embedded_bits
+
+    def _nucleus_sampling(self, logits: torch.Tensor, top_p: float, max_candidates: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        根据logits执行Top-p (nucleus)采样
+        """
+        probabilities = torch.softmax(logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
+        
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 0] = False
+        
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        probabilities[indices_to_remove] = 0
+        
+        probabilities /= torch.sum(probabilities, dim=-1, keepdim=True)
+        
+        top_logits, top_indices = torch.topk(probabilities, max_candidates)
+        
+        return top_logits, top_indices
 
     def _get_context_embedding(self, context_tokens: torch.Tensor) -> torch.Tensor:
         """

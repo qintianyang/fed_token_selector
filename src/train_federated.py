@@ -27,11 +27,13 @@ class WatermarkDataset(Dataset):
                  num_samples: int = 1000,
                  vocab_size: int = 50000,
                  max_seq_len: int = 128,
-                 top_k: int = 50):
+                 top_p: float = 0.92,
+                 max_candidate_tokens: int = 50):
         self.num_samples = num_samples
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
-        self.top_k = top_k
+        self.top_p = top_p
+        self.max_candidate_tokens = max_candidate_tokens
         
         # 生成模拟数据
         self.data = self._generate_synthetic_data()
@@ -48,21 +50,42 @@ class WatermarkDataset(Dataset):
             # 模拟大模型输出的logits (未归一化)
             logits = torch.randn(self.vocab_size) * 2.0
             
-            # 获取top-k token和对应的logits
-            top_k_logits, top_k_indices = torch.topk(logits, self.top_k)
+            # 获取top-p token和对应的logits
+            top_p_logits, top_p_indices = self._nucleus_sampling(logits)
             
             # 随机生成目标水印比特
             target_bit = torch.randint(0, 2, (1,)).float()
             
             data.append({
                 'context_tokens': context_tokens,
-                'top_k_logits': top_k_logits,
-                'top_k_indices': top_k_indices,
+                'top_p_logits': top_p_logits,
+                'top_p_indices': top_p_indices,
                 'target_bit': target_bit
             })
             
         return data
     
+    def _nucleus_sampling(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        根据logits执行Top-p (nucleus)采样
+        """
+        probabilities = torch.softmax(logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
+        
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        sorted_indices_to_remove = cumulative_probs > self.top_p
+        sorted_indices_to_remove[..., 0] = False
+        
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        probabilities[indices_to_remove] = 0
+        
+        probabilities /= torch.sum(probabilities, dim=-1, keepdim=True)
+        
+        top_logits, top_indices = torch.topk(probabilities, self.max_candidate_tokens)
+        
+        return top_logits, top_indices
+
     def __len__(self):
         return len(self.data)
     
@@ -87,8 +110,8 @@ def collate_fn(batch):
     
     return {
         'context_tokens': torch.stack(context_tokens),
-        'top_k_logits': torch.stack([item['top_k_logits'] for item in batch]),
-        'top_k_indices': torch.stack([item['top_k_indices'] for item in batch]),
+        'top_p_logits': torch.stack([item['top_p_logits'] for item in batch]),
+        'top_p_indices': torch.stack([item['top_p_indices'] for item in batch]),
         'target_bit': torch.stack([item['target_bit'] for item in batch])
     }
 
@@ -120,7 +143,7 @@ class FederatedTrainer:
             hidden_dim=config['hidden_dim'],
             num_layers=config.get('num_layers', 3),
             dropout=config.get('dropout', 0.1),
-            top_k=config['top_k']
+            top_k=config.get('model', {}).get('max_candidate_tokens', 50) # 使用max_candidate_tokens
         ).to(device)
         
         # 初始化联邦学习组件
@@ -138,7 +161,8 @@ class FederatedTrainer:
             dataset = WatermarkDataset(
                 num_samples=config['samples_per_client'],
                 vocab_size=config['vocab_size'],
-                top_k=config['top_k']
+                top_p=config.get('model', {}).get('top_p', 0.92),
+                max_candidate_tokens=config.get('model', {}).get('max_candidate_tokens', 50)
             )
             
             dataloader = DataLoader(

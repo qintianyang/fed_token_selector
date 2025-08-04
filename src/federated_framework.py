@@ -73,6 +73,10 @@ class FederatedClient:
             gamma=config.get('gamma', 0.25)
         )
         
+        # 采样参数
+        self.top_p = config.get('model', {}).get('top_p', 0.92)
+        self.max_candidate_tokens = config.get('model', {}).get('max_candidate_tokens', 50)
+
         # 训练统计
         self.training_stats = {
             'total_loss': [],
@@ -139,11 +143,10 @@ class FederatedClient:
         """
         context_tokens = batch['context_tokens']  # [batch_size, seq_len]
         batch_size = context_tokens.size(0)
-        top_k = self.config.get('top_k', 50)
         
         context_embeddings = []
-        top_k_logits_list = []
-        top_k_indices_list = []
+        top_p_logits_list = []
+        top_p_indices_list = []
         
         for i in range(batch_size):
             # 获取单个样本的context tokens
@@ -158,8 +161,10 @@ class FederatedClient:
                 try:
                     # 使用真实大模型获取logits
                     full_logits = self.llm_interface.get_next_token_logits(sample_tokens)
-                    top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
                     
+                    # 应用Top-p (nucleus) 采样
+                    top_p_logits, top_p_indices = self._nucleus_sampling(full_logits)
+
                     # 使用LLM接口获取有意义的上下文嵌入
                     context_embedding = self.llm_interface.get_context_embedding(sample_tokens)
                     
@@ -167,25 +172,54 @@ class FederatedClient:
                     self.logger.warning(f"使用LLM接口获取数据时出错: {e}，将回退到模拟数据")
                     # 回退到模拟数据
                     full_logits = torch.randn(self.config.get('vocab_size', 50000))
-                    top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
+                    top_p_logits, top_p_indices = self._nucleus_sampling(full_logits)
                     context_embedding = torch.randn(expected_context_dim)
             else:
                 # 使用模拟数据
                 full_logits = torch.randn(self.config.get('vocab_size', 50000))
-                top_k_logits, top_k_indices = torch.topk(full_logits, top_k)
+                top_p_logits, top_p_indices = self._nucleus_sampling(full_logits)
                 context_embedding = torch.randn(expected_context_dim)
             
             context_embeddings.append(context_embedding)
-            top_k_logits_list.append(top_k_logits)
-            top_k_indices_list.append(top_k_indices)
+            top_p_logits_list.append(top_p_logits)
+            top_p_indices_list.append(top_p_indices)
         
         # 堆叠为批次张量
         context_embedding_batch = torch.stack(context_embeddings)
-        top_k_logits_batch = torch.stack(top_k_logits_list)
-        top_k_indices_batch = torch.stack(top_k_indices_list)
+        top_p_logits_batch = torch.stack(top_p_logits_list)
+        top_p_indices_batch = torch.stack(top_p_indices_list)
         
-        return context_embedding_batch, top_k_logits_batch, top_k_indices_batch
-    
+        return context_embedding_batch, top_p_logits_batch, top_p_indices_batch
+
+    def _nucleus_sampling(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        根据logits执行Top-p (nucleus)采样
+        """
+        probabilities = torch.softmax(logits, dim=-1)
+        sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
+        
+        # 计算累积概率
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # 寻找满足top_p的最小索引集
+        # 移除那些累积概率超过top_p的token
+        sorted_indices_to_remove = cumulative_probs > self.top_p
+        # 我们至少要保留一个token
+        sorted_indices_to_remove[..., 0] = False
+        
+        # 将要移除的token的概率设置为0
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        probabilities[indices_to_remove] = 0
+        
+        # 重新归一化概率
+        probabilities /= torch.sum(probabilities, dim=-1, keepdim=True)
+        
+        # 从新的概率分布中获取top-k token
+        # 这里的k是最坏情况下的候选数量
+        top_logits, top_indices = torch.topk(probabilities, self.max_candidate_tokens)
+        
+        return top_logits, top_indices
+
     def _train_batch(self, batch: Dict[str, torch.Tensor]) -> float:
         """
         训练单个批次
