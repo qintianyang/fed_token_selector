@@ -20,23 +20,71 @@ logger = logging.getLogger(__name__)
 class WatermarkDataset(Dataset):
     """
     水印训练数据集
-    模拟大模型的输出logits和对应的上下文
+    从真实文本数据加载，或生成模拟数据
     """
     
     def __init__(self, 
-                 num_samples: int = 1000,
-                 vocab_size: int = 50000,
-                 max_seq_len: int = 128,
-                 top_p: float = 0.92,
-                 max_candidate_tokens: int = 50):
-        self.num_samples = num_samples
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.top_p = top_p
-        self.max_candidate_tokens = max_candidate_tokens
+                 config: Dict,
+                 data_path: Optional[str] = None,
+                 llm_interface: Optional[BaseLLMInterface] = None):
+        self.config = config
+        self.data_path = data_path
+        self.llm_interface = llm_interface
         
-        # 生成模拟数据
-        self.data = self._generate_synthetic_data()
+        # 从配置中获取参数
+        self.vocab_size = config.get('vocab_size', 50000)
+        self.max_seq_len = config.get('max_seq_len', 128)
+        self.top_p = config.get('model', {}).get('top_p', 0.92)
+        self.max_candidate_tokens = config.get('model', {}).get('max_candidate_tokens', 50)
+        self.num_samples = config.get('samples_per_client', 1000)
+        
+        # 加载或生成数据
+        if self.data_path and os.path.exists(self.data_path):
+            self.data = self._load_real_data()
+        else:
+            logger.warning(f"数据文件未找到或未提供，将使用合成数据。")
+            self.data = self._generate_synthetic_data()
+
+    def _load_real_data(self) -> List[Dict]:
+        """从真实数据文件加载和处理数据"""
+        data = []
+        with open(self.data_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # 根据需要对数据进行采样
+        if len(lines) > self.num_samples:
+            lines = np.random.choice(lines, self.num_samples, replace=False)
+            
+        for line in tqdm(lines, desc="处理真实数据"):
+            text = line.strip()
+            if not text or self.llm_interface is None:
+                continue
+
+            try:
+                # 将文本转换为token
+                tokens = self.llm_interface.tokenizer.encode(text)
+                
+                # 将数据分割为prompt和completion
+                if len(tokens) < 20: continue # 忽略太短的文本
+                split_point = len(tokens) - 10 # 假设最后10个token为completion
+                prompt_tokens = tokens[:split_point]
+                
+                # 获取LLM的logits
+                logits = self.llm_interface.get_next_token_logits(prompt_tokens)
+                top_p_logits, top_p_indices = self._nucleus_sampling(logits)
+                
+                target_bit = torch.randint(0, 2, (1,)).float()
+                
+                data.append({
+                    'context_tokens': torch.tensor(prompt_tokens, dtype=torch.long),
+                    'top_p_logits': top_p_logits,
+                    'top_p_indices': top_p_indices,
+                    'target_bit': target_bit
+                })
+            except Exception as e:
+                logger.warning(f"处理行失败: {e}")
+                
+        return data
         
     def _generate_synthetic_data(self) -> List[Dict]:
         """生成合成训练数据"""
@@ -110,8 +158,8 @@ def collate_fn(batch):
     
     return {
         'context_tokens': torch.stack(context_tokens),
-        'top_p_logits': torch.stack([item['top_p_logits'] for item in batch]),
-        'top_p_indices': torch.stack([item['top_p_indices'] for item in batch]),
+        'top_k_logits': torch.stack([item['top_p_logits'] for item in batch]),
+        'top_k_indices': torch.stack([item['top_p_indices'] for item in batch]),
         'target_bit': torch.stack([item['target_bit'] for item in batch])
     }
 
@@ -124,11 +172,13 @@ class FederatedTrainer:
                  config: Dict,
                  num_clients: int = 5,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-                 llm_config: Optional[Dict] = None):
+                 llm_config: Optional[Dict] = None,
+                 data_paths: Optional[List[str]] = None):
         self.config = config
         self.num_clients = num_clients
         self.device = device
         self.llm_config = llm_config or config.get('llm_config', {})
+        self.data_paths = data_paths
         
         # 动态获取context_dim
         context_dim = self._get_llm_embedding_dim()
@@ -157,12 +207,21 @@ class FederatedTrainer:
         # 初始化客户端
         self.clients = []
         for i in range(num_clients):
+            client_llm_interface = self._create_llm_interface_for_client(i)
+            
+            # 为每个客户端分配数据路径
+            client_data_path = None
+            if self.data_paths:
+                if len(self.data_paths) == 1:
+                    client_data_path = self.data_paths[0]  # 所有客户端使用相同的数据路径
+                elif i < len(self.data_paths):
+                    client_data_path = self.data_paths[i]
+
             # 每个客户端有自己的数据集
             dataset = WatermarkDataset(
-                num_samples=config['samples_per_client'],
-                vocab_size=config['vocab_size'],
-                top_p=config.get('model', {}).get('top_p', 0.92),
-                max_candidate_tokens=config.get('model', {}).get('max_candidate_tokens', 50)
+                config=self.config,
+                data_path=client_data_path,
+                llm_interface=client_llm_interface
             )
             
             dataloader = DataLoader(
@@ -172,73 +231,40 @@ class FederatedTrainer:
                 collate_fn=collate_fn
             )
             
-            # 为每个客户端创建大模型接口（可选）
-            client_llm_interface = None
-            if self.llm_config.get('enabled', False):
-                try:
-                    interface_type = self.llm_config.get('type', 'huggingface')
-                    
-                    # 根据接口类型提取对应配置
-                    if interface_type == 'huggingface':
-                        hf_config = self.llm_config.get('huggingface', {})
-                        # 解析 'auto' 设备
-                        llm_device = hf_config.get('device', 'auto')
-                        if llm_device == 'auto':
-                            llm_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    
-                        client_llm_interface = LLMInterfaceFactory.create_interface(
-                            interface_type='huggingface',
-                            model_name=hf_config.get('model_name', 'gpt2'),
-                            config={
-                                'device': llm_device,
-                                'cache_dir': hf_config.get('cache_dir', './models')
-                            }
-                        )
-                    elif interface_type == 'openai':
-                        openai_config = self.llm_config.get('openai', {})
-                        client_llm_interface = LLMInterfaceFactory.create_interface(
-                            'openai',
-                            model_name=openai_config.get('model_name', 'gpt-3.5-turbo'),
-                            config={
-                                'api_key': openai_config.get('api_key', ''),
-                                'base_url': openai_config.get('base_url', 'https://api.openai.com/v1'),
-                                'num_samples': openai_config.get('num_samples', 50)
-                            }
-                        )
-                    elif interface_type == 'local':
-                        local_config = self.llm_config.get('local', {})
-                        client_llm_interface = LLMInterfaceFactory.create_interface(
-                            'local',
-                            model_path=local_config.get('model_path', './models/local_model.pth'),
-                            config={
-                                'device': local_config.get('device', 'auto')
-                            }
-                        )
-                    
-                    logger.info(f"客户端 {i} 创建大模型接口成功")
-                except Exception as e:
-                    logger.warning(f"客户端 {i} 大模型接口创建失败: {e}")
-            
             client = FederatedClient(
                 client_id=i,
                 model=TokenSelectorController(
-                    vocab_size=config['vocab_size'],
-                    context_dim=context_dim,  # 使用动态获取的维度
-                    hidden_dim=config['hidden_dim'],
-                    num_layers=config.get('num_layers', 3),      
-                    dropout=config.get('dropout', 0.1),          
-                    top_k=config['top_k']
-                ).to(device),
+                    vocab_size=self.config['vocab_size'],
+                    context_dim=self._get_llm_embedding_dim() or self.config['context_dim'],
+                    hidden_dim=self.config['hidden_dim'],
+                    num_layers=self.config.get('num_layers', 3),
+                    dropout=self.config.get('dropout', 0.1),
+                    top_k=self.config.get('model', {}).get('max_candidate_tokens', 50)
+                ).to(self.device),
                 local_data=dataloader,
-                config=config,
+                config=self.config,
                 llm_interface=client_llm_interface
             )
             self.clients.append(client)
 
-    def _get_llm_embedding_dim(self) -> Optional[int]:
-        """尝试创建一个临时的LLM接口来获取嵌入维度"""
+    def _create_llm_interface_for_client(self, client_id: int) -> Optional[BaseLLMInterface]:
+        """为客户端创建LLM接口"""
         if not self.llm_config.get('enabled', False):
             return None
+        try:
+            interface_type = self.llm_config.get('type', 'huggingface')
+            interface = LLMInterfaceFactory.create_interface(interface_type, **self.llm_config)
+            logger.info(f"客户端 {client_id} 创建LLM接口成功")
+            return interface
+        except Exception as e:
+            logger.warning(f"客户端 {client_id} LLM接口创建失败: {e}")
+            return None
+
+    def _get_llm_embedding_dim(self) -> Optional[int]:
+        """动态获取LLM的嵌入维度"""
+        if not self.llm_config.get('enabled', False):
+            return None
+        
         try:
             interface_type = self.llm_config.get('type', 'huggingface')
             temp_interface = LLMInterfaceFactory.create_interface(

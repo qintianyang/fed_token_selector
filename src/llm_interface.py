@@ -122,16 +122,22 @@ class LLMInterfaceFactory:
     """大模型接口工厂"""
     @staticmethod
     def create_interface(interface_type: str, **kwargs) -> BaseLLMInterface:
-        # 从kwargs中安全地提取config
-        model_config = kwargs.pop('config', {})
+        # 从kwargs中安全地提取model_name
         model_name = kwargs.pop('model_name', None)
 
         if not model_name:
-            raise ValueError("创建LLM接口时必须提供 'model_name'")
+            # 尝试从特定于类型的配置中获取model_name
+            if interface_type in kwargs and 'model_name' in kwargs[interface_type]:
+                model_name = kwargs[interface_type].get('model_name')
+            else:
+                raise ValueError("创建LLM接口时必须提供 'model_name'")
+
+        # 剩下的kwargs作为配置传递
+        config = kwargs
 
         if interface_type == 'huggingface':
-            return HuggingFaceInterface(model_name=model_name, config=model_config)
+            return HuggingFaceInterface(model_name=model_name, config=config)
         elif interface_type == 'openai':
-            return OpenAIInterface(model_name=model_name, config=model_config)
+            return OpenAIInterface(model_name=model_name, config=config)
         else:
             raise ValueError(f"未知的接口类型: {interface_type}")
