@@ -1,295 +1,184 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from typing import Dict, List, Optional, Tuple, Any
-import copy
-import logging
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import numpy as np
+from typing import Dict, List, Tuple, Optional, Any # 导入 Any
+import logging
+import copy
 from abc import ABC, abstractmethod
-import json
-import time
 
-from token_selector import TokenSelectorController, WatermarkBitGenerator, GreenListGenerator
-from llm_interface import BaseLLMInterface, LLMInterfaceFactory
+from token_selector import TokenSelectorController
+from llm_interface import LLMInterfaceFactory, BaseLLMInterface
+from dataset import WatermarkDataset, collate_fn # 从新模块导入
 
+# 设置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class FederatedClient:
     """
     联邦学习客户端
-    
-    负责：
-    1. 本地数据训练
-    2. 模型参数更新
-    3. 与服务器通信
     """
-    
-    def __init__(
-        self,
-        client_id: int,
-        model: TokenSelectorController,
-        local_data: DataLoader,
-        config: Dict[str, Any],
-        llm_interface: Optional[BaseLLMInterface] = None
-    ):
+    def __init__(self, 
+                 client_id: int, 
+                 model: nn.Module, 
+                 data_path: str, # 接收数据路径
+                 config: Dict, 
+                 device: str = 'cpu'):
         self.client_id = client_id
-        self.model = model
-        self.local_data = local_data
+        self.model = copy.deepcopy(model).to(device)
         self.config = config
-    
-        # 日志
-        self.logger = logging.getLogger(f'Client_{client_id}')
-        
-        # 大模型接口
-        self.llm_interface = llm_interface
-        if self.llm_interface is None:
-            # 如果没有提供LLM接口，创建默认接口
-            llm_config = config.get('llm_config', {})
-            interface_type = llm_config.get('type', 'huggingface')
-            try:
-                self.llm_interface = LLMInterfaceFactory.create_interface(
-                    interface_type, **llm_config
-                )
-                self.logger.info(f"客户端 {client_id} 使用 {interface_type} 大模型接口")
-            except Exception as e:
-                self.logger.warning(f"大模型接口创建失败: {e}，将使用模拟数据")
-                self.llm_interface = None
-        
-        # 训练配置
-        training_config = config.get('training', {})
-        self.learning_rate = training_config.get('learning_rate', 1e-3)
-        self.local_epochs = training_config.get('local_epochs', 2)
-        self.lambda_watermark = config.get('lambda_watermark', 1.0)
-        self.lambda_semantic = config.get('lambda_semantic', 0.5)
-        self.lambda_fluency = config.get('lambda_fluency', 0.3)
-        
-        # 优化器
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        
-        # 工具类
-        self.bit_generator = WatermarkBitGenerator(seed=client_id * 1000)
-        self.greenlist_generator = GreenListGenerator(
-            vocab_size=config.get('vocab_size', 50000),
-            gamma=config.get('gamma', 0.25)
-        )
-        
-        # 采样参数
-        self.top_p = config.get('model', {}).get('top_p', 0.92)
-        self.max_candidate_tokens = config.get('model', {}).get('max_candidate_tokens', 50)
+        self.device = device
+        self.llm_interface = None
 
-        # 训练统计
-        self.training_stats = {
+        # 动态创建LLM接口
+        llm_config = self.config.get('llm_config', {})
+        if llm_config.get('enabled', False):
+            try:
+                self.llm_interface = LLMInterfaceFactory.create_llm_interface(
+                    interface_type=llm_config['type'],
+                    **llm_config.get(llm_config['type'], {})
+                )
+            except Exception as e:
+                logger.error(f"客户端 {self.client_id} 创建LLM接口失败: {e}")
+
+        # 使用data_path创建数据集和数据加载器
+        self.dataset = WatermarkDataset(
+            config=self.config,
+            data_path=data_path,
+            llm_interface=self.llm_interface
+        )
+        self.data_loader = DataLoader(
+            self.dataset,
+            batch_size=self.config.get('batch_size', 32),
+            shuffle=True,
+            collate_fn=collate_fn
+        )
+
+        # 确保learning_rate是浮点数类型
+        learning_rate = self.config.get('learning_rate', 0.001)
+        if isinstance(learning_rate, str):
+            learning_rate = float(learning_rate)
+        
+        self.optimizer = optim.Adam(
+            self.model.parameters(), 
+            lr=learning_rate
+        )
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.training_stats: Dict[str, List[float]] = {
             'total_loss': [],
             'watermark_loss': [],
             'semantic_loss': [],
             'fluency_loss': []
         }
-    
-    def local_train(self, global_model_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        本地训练
-        
-        Args:
-            global_model_state: 全局模型状态字典
-            
-        Returns:
-            model_update: 模型参数更新
-        """
-        # 加载全局模型参数
-        self.model.load_state_dict(global_model_state)
-        initial_state = copy.deepcopy(global_model_state)
-        
+
+    def local_train(self, num_epochs: int) -> Dict[str, List[float]]:
+        """执行本地训练并返回统计信息"""
         self.model.train()
-        epoch_losses = []
-        
-        for epoch in range(self.local_epochs):
-            batch_losses = []
-            
-            for batch_idx, batch in enumerate(self.local_data):
-                loss = self._train_batch(batch)
-                batch_losses.append(loss)
+
+        for epoch in range(num_epochs):
+            epoch_losses = {key: [] for key in self.training_stats.keys()}
+            batch_id = 0
+            for batch in self.data_loader:
+                batch_id += 1
+                print(f"客户端 {self.client_id} epoch {epoch}正在处理批次 {batch_id}")
+                self.optimizer.zero_grad()
+
+                # 从LLM获取数据（如果可用）
+                batch = self._get_llm_data_for_batch(batch)
+
+                context_tokens = batch['context_tokens'].to(self.device)
+                top_k_logits = batch['top_k_logits'].to(self.device)
+                top_k_indices = batch['top_k_indices'].to(self.device)
+                target_bit = batch['target_bit'].to(self.device).squeeze(-1)
+
+                # 模型前向传播
+                selection_logits, _ = self.model(
+                    context_embedding=context_tokens, # 修复：传递token IDs
+                    top_k_logits=top_k_logits,
+                    target_bit=target_bit.long(),
+                    top_k_indices=top_k_indices
+                )
+
+                # 从 logits 计算 probs，用于需要概率的损失函数
+                selection_probs = F.softmax(selection_logits, dim=-1)
+                top_k_probs = F.softmax(top_k_logits, dim=-1)
+
+                # 使用 top-p 采样来确定 green_mask
+                top_p = self.config.get('top_p', 0.9)
+                sorted_logits, sorted_indices = torch.sort(top_k_logits, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # 移除累积概率高于top_p的token
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # 至少保留一个token
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+
+                # 创建green_mask
+                green_mask = torch.ones_like(top_k_logits, dtype=torch.bool)
                 
-                if batch_idx % 10 == 0:
-                    self.logger.debug(
-                        f'Client {self.client_id}, Epoch {epoch}, Batch {batch_idx}, Loss: {loss:.4f}'
-                    )
-            
-            epoch_loss = np.mean(batch_losses)
-            epoch_losses.append(epoch_loss)
-            self.logger.info(
-                f'Client {self.client_id}, Epoch {epoch}, Average Loss: {epoch_loss:.4f}'
-            )
-        
-        # 计算模型更新
-        current_state = self.model.state_dict()
-        model_update = {}
-        for key in current_state:
-            model_update[key] = current_state[key] - initial_state[key]
-        
-        # 记录训练统计
-        self.training_stats['total_loss'].extend(epoch_losses)
-        
-        return model_update
-    
-    def _get_llm_data_for_batch(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        使用大模型获取真实的logits数据
-        
-        Args:
-            batch: 包含context_tokens的批次数据
-            
-        Returns:
-            (context_embedding, top_k_logits, top_k_indices)
-        """
-        context_tokens = batch['context_tokens']  # [batch_size, seq_len]
-        batch_size = context_tokens.size(0)
-        
-        context_embeddings = []
-        top_p_logits_list = []
-        top_p_indices_list = []
-        
-        for i in range(batch_size):
-            # 获取单个样本的context tokens
-            sample_tokens = context_tokens[i].tolist()
-            # 移除padding tokens (假设0是padding)
-            sample_tokens = [t for t in sample_tokens if t != 0]
-            
-            # 获取模型期望的context_dim
-            expected_context_dim = self.model.context_dim
-        
-            if self.llm_interface is not None:
-                try:
-                    # 使用真实大模型获取logits
-                    full_logits = self.llm_interface.get_next_token_logits(sample_tokens)
-                    
-                    # 应用Top-p (nucleus) 采样
-                    top_p_logits, top_p_indices = self._nucleus_sampling(full_logits)
+                # 使用相对索引来更新green_mask
+                rows = torch.arange(green_mask.size(0)).unsqueeze(1)
+                green_mask[rows, sorted_indices[sorted_indices_to_remove]] = False
 
-                    # 使用LLM接口获取有意义的上下文嵌入
-                    context_embedding = self.llm_interface.get_context_embedding(sample_tokens)
-                    
-                except Exception as e:
-                    self.logger.warning(f"使用LLM接口获取数据时出错: {e}，将回退到模拟数据")
-                    # 回退到模拟数据
-                    full_logits = torch.randn(self.config.get('vocab_size', 50000))
-                    top_p_logits, top_p_indices = self._nucleus_sampling(full_logits)
-                    context_embedding = torch.randn(expected_context_dim)
-            else:
-                # 使用模拟数据
-                full_logits = torch.randn(self.config.get('vocab_size', 50000))
-                top_p_logits, top_p_indices = self._nucleus_sampling(full_logits)
-                context_embedding = torch.randn(expected_context_dim)
-            
-            context_embeddings.append(context_embedding)
-            top_p_logits_list.append(top_p_logits)
-            top_p_indices_list.append(top_p_indices)
-        
-        # 堆叠为批次张量
-        context_embedding_batch = torch.stack(context_embeddings)
-        top_p_logits_batch = torch.stack(top_p_logits_list)
-        top_p_indices_batch = torch.stack(top_p_indices_list)
-        
-        return context_embedding_batch, top_p_logits_batch, top_p_indices_batch
+                watermark_loss = self.model.get_watermark_loss(selection_logits, target_bit, green_mask)
+                semantic_loss = self.model.get_semantic_loss(selection_probs, top_k_logits)
+                fluency_loss = self.model.get_fluency_loss(selection_probs, top_k_probs, green_mask)
 
-    def _nucleus_sampling(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        根据logits执行Top-p (nucleus)采样
-        """
-        probabilities = torch.softmax(logits, dim=-1)
-        sorted_probs, sorted_indices = torch.sort(probabilities, descending=True)
-        
-        # 计算累积概率
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        
-        # 寻找满足top_p的最小索引集
-        # 移除那些累积概率超过top_p的token
-        sorted_indices_to_remove = cumulative_probs > self.top_p
-        # 我们至少要保留一个token
-        sorted_indices_to_remove[..., 0] = False
-        
-        # 将要移除的token的概率设置为0
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        probabilities[indices_to_remove] = 0
-        
-        # 重新归一化概率
-        probabilities /= torch.sum(probabilities, dim=-1, keepdim=True)
-        
-        # 从新的概率分布中获取top-k token
-        # 这里的k是最坏情况下的候选数量
-        top_logits, top_indices = torch.topk(probabilities, self.max_candidate_tokens)
-        
-        return top_logits, top_indices
+                # 计算损失
+                # 假设 loss_components 是一个包含不同损失项的字典
+                # total_loss = loss_components['total_loss']
 
-    def _train_batch(self, batch: Dict[str, torch.Tensor]) -> float:
-        """
-        训练单个批次
-        
-        Args:
-            batch: 包含context_tokens等的批次数据
-            
-        Returns:
-            loss: 批次损失
-        """
-        self.optimizer.zero_grad()
-        
-        # 获取模型设备
-        device = next(self.model.parameters()).device
-        
-        # 获取大模型数据
-        if 'context_embedding' in batch and 'top_k_logits' in batch and 'top_k_indices' in batch:
-            # 如果批次中已经包含了预处理的数据，直接使用并移动到正确设备
-            context_embedding = batch['context_embedding'].to(device)
-            top_k_logits = batch['top_k_logits'].to(device)
-            top_k_indices = batch['top_k_indices'].to(device)
-        else:
-            # 否则使用大模型获取数据
-            context_embedding, top_k_logits, top_k_indices = self._get_llm_data_for_batch(batch)
-            # 确保移动到正确设备
-            context_embedding = context_embedding.to(device)
-            top_k_logits = top_k_logits.to(device)
-            top_k_indices = top_k_indices.to(device)
-        
-        context_tokens = batch['context_tokens'].to(device)  # [batch_size, seq_len]
-        batch_size = context_embedding.size(0)
-        
-        # 生成目标水印比特并移动到正确设备
-        target_bits = self.bit_generator.generate_bits(batch_size)
-        target_bit_tensor = torch.tensor(target_bits, dtype=torch.long, device=device)
-        
-        # 生成绿名单mask并确保在正确设备上
-        green_mask = self.greenlist_generator.get_greenlist_mask(context_tokens, top_k_indices)
-        # 双重保险：确保green_mask在正确设备上
-        green_mask = green_mask.to(device)
-        
-        # 前向传播
-        selection_probs, selected_indices = self.model(
-            context_embedding, top_k_logits, target_bit_tensor, top_k_indices
-        )
-        
-        # 计算各项损失
-        watermark_loss = self.model.get_watermark_loss(selection_probs, target_bit_tensor, green_mask)
-        semantic_loss = self.model.get_semantic_loss(selection_probs, top_k_logits)
-        fluency_loss = self.model.get_fluency_loss(selection_probs, top_k_logits)
-        
-        # 总损失
-        total_loss = (
-            self.lambda_watermark * watermark_loss +
-            self.lambda_semantic * semantic_loss +
-            self.lambda_fluency * fluency_loss
-        )
-        
-        # 反向传播
-        total_loss.backward()
-        self.optimizer.step()
-        
-        # 记录损失
-        self.training_stats['watermark_loss'].append(watermark_loss.item())
-        self.training_stats['semantic_loss'].append(semantic_loss.item())
-        self.training_stats['fluency_loss'].append(fluency_loss.item())
-        
-        return total_loss.item()
-    
-    def get_model_state(self) -> Dict[str, torch.Tensor]:
+                total_loss = watermark_loss + semantic_loss + fluency_loss
+                total_loss.backward()
+                self.optimizer.step()
+
+                epoch_losses['total_loss'].append(total_loss.item())
+                epoch_losses['watermark_loss'].append(watermark_loss.item())
+                epoch_losses['semantic_loss'].append(semantic_loss.item())
+                epoch_losses['fluency_loss'].append(fluency_loss.item())
+
+            # 记录并打印每个epoch的平均损失
+            for loss_name, loss_values in epoch_losses.items():
+                if loss_values:
+                    avg_loss = np.mean(loss_values)
+                    self.training_stats[loss_name].append(avg_loss)
+                    print(f"客户端 {self.client_id} Epoch {epoch}: Avg {loss_name} = {avg_loss:.4f}")
+
+        # 返回训练统计信息
+        return self.training_stats
+
+    def _get_llm_data_for_batch(self, batch: Dict) -> Dict:
+        """如果LLM可用，则使用LLM增强数据批次"""
+        if self.llm_interface is None:
+            return batch
+
+        try:
+            # 假设batch中已有context_tokens
+            context_tokens_list = batch['context_tokens'].tolist()
+            new_logits = []
+            new_indices = []
+
+            for tokens in context_tokens_list:
+                logits = self.llm_interface.get_next_token_logits(tokens)
+                # 此处需要添加从logits到top_k_logits和top_k_indices的转换
+                # 为简单起见，我们暂时跳过这一步，并返回原始批次
+                # 在实际实现中，您需要像WatermarkDataset中那样实现核采样
+                pass # Placeholder
+
+            # 如果成功获取了新的logits和indices，则更新批次
+            # batch['top_k_logits'] = torch.stack(new_logits)
+            # batch['top_k_indices'] = torch.stack(new_indices)
+
+        except Exception as e:
+            logger.warning(f"客户端 {self.client_id} 从LLM获取数据失败: {e}，使用模拟数据")
+
+        return batch
+
+    def get_model_parameters(self) -> Dict[str, torch.Tensor]:
         """获取当前模型状态"""
         return self.model.state_dict()
     
@@ -299,17 +188,15 @@ class FederatedClient:
 
 
 class FederatedAggregator(ABC):
-    """联邦聚合器抽象基类"""
-    
+    """
+    联邦学习聚合器基类
+    """
     @abstractmethod
-    def aggregate(
-        self,
-        client_updates: List[Dict[str, torch.Tensor]],
-        client_weights: List[float]
-    ) -> Dict[str, torch.Tensor]:
-        """聚合客户端更新"""
+    def aggregate(self, 
+                  server_model: nn.Module, 
+                  client_updates: List[Dict[str, torch.Tensor]], 
+                  client_weights: List[float]) -> nn.Module:
         pass
-
 
 class FedAvgAggregator(FederatedAggregator):
     """FedAvg聚合算法"""

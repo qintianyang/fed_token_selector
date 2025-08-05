@@ -8,7 +8,7 @@ data_paths:
 experiment:
   name: "federated_watermarking_llama3.2_1B"
   description: "使用Llama-3.2-1B进行联邦水印学习的实验"
-  device: "cuda"  # 训练设备 ('cuda' or 'cpu')
+  device: "cuda:0"  # <--- 在这里设置全局训练设备，例如 'cuda:0', 'cuda:1'
   seed: 42
   output_dir: "./outputs"
   save_frequency: 20
@@ -17,7 +17,7 @@ experiment:
 
 # 模型配置
 model:
-  vocab_size: 50000
+  vocab_size: 128256  # <--- 修改：与Llama-3模型的词汇表大小匹配
   hidden_dim: 256
   top_p: 0.92
   max_candidate_tokens: 50
@@ -35,18 +35,35 @@ watermark:
 # 联邦学习配置
 federated:
   num_clients: 2
-  num_rounds: 1
+  num_rounds: 5000
   client_fraction: 1.0
   aggregation_method: "fedavg"
+  clients:
+    - client_id: 0
+      llm_config:
+        enabled: true
+        type: "huggingface"
+        huggingface:
+          model_name: "meta-llama/Llama-3.2-1B"  # <-- 保持模型在Hugging Face上的名称
+          cache_dir: "/home/qty/code/llama"  # <-- 指定包含此模型的缓存目录
+          device: "cuda:0"
+    - client_id: 1
+      llm_config:
+        enabled: true
+        type: "huggingface"
+        huggingface:
+          model_name: "meta-llama/Llama-3.2-1B"  # <-- 保持模型在Hugging Face上的名称
+          cache_dir: "/home/qty/code/llama"  # <-- 指定包含此模型的缓存目录
+          device: "cuda:0"
   fedprox:
     mu: 0.01
 
 # 训练配置
 training:
-  learning_rate: 1e-4
+  learning_rate: 1.0e-4
   batch_size: 32
-  local_epochs: 1
-  samples_per_client: 1000
+  local_epochs: 100
+  samples_per_client: 1000 # 确保这个值是1000
   loss_weights:
     watermark: 1.0
     semantic: 0.5
@@ -63,7 +80,7 @@ training:
 # 数据配置
 data:
   max_seq_len: 128
-  min_seq_len: 10
+  min_seq_len: 50
   synthetic_data: false
   real_data:
     dataset_name: "c4"
@@ -89,22 +106,8 @@ visualization:
   save_plots: true
   plot_format: "png"
 
-# 大模型接口配置
-llm_config:
-  enabled: true
-  type: "huggingface"
-  huggingface:
-    model_name: "meta-llama/Llama-3.2-1B"
-    device: "cuda"
-    cache_dir: "/home/qty/code/llama"
-  openai:
-    model_name: "gpt-3.5-turbo"
-    api_key: ""
-    base_url: "https://api.openai.com/v1"
-    num_samples: 50
-  local:
-    model_path: "./models/local_model.pth"
-    device: "auto"
+# 注意：LLM配置现在在每个客户端中单独配置
+# 请参考 federated.clients 部分的 llm_config 配置
 
 # 安全配置
 security:

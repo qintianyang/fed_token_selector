@@ -41,12 +41,14 @@ class BaseLLMInterface(ABC):
         """获取模型嵌入层维度"""
         pass
 
+    @abstractmethod
+    def decode(self, tokens: List[int]) -> str:
+        """将token ID列表解码为文本"""
+        pass
+
 class HuggingFaceInterface(BaseLLMInterface):
     """HuggingFace模型接口"""
     def __init__(self, model_name: str, config: Optional[Dict] = None):
-        if not HUGGINGFACE_AVAILABLE:
-            raise ImportError("HuggingFace transformers库未安装，请运行 'pip install transformers torch'")
-        
         config = config or {}
         device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         cache_dir = config.get('cache_dir')
@@ -74,6 +76,8 @@ class HuggingFaceInterface(BaseLLMInterface):
 
     def get_context_embedding(self, context_tokens: List[int]) -> torch.Tensor:
         with torch.no_grad():
+            if not context_tokens:
+                return torch.zeros(self.get_embedding_dim()).to(self.device)
             inputs = torch.tensor([context_tokens]).to(self.device)
             outputs = self.model(inputs, output_hidden_states=True)
             hidden_states = outputs.hidden_states[-1]
@@ -82,6 +86,11 @@ class HuggingFaceInterface(BaseLLMInterface):
 
     def get_embedding_dim(self) -> int:
         return self.model.config.hidden_size
+
+    def decode(self, tokens: List[int]) -> str:
+        """使用HuggingFace分词器解码token"""
+        # 修改解码方式，以避免乱码
+        return self.tokenizer.decode(tokens, skip_special_tokens=False, clean_up_tokenization_spaces=True)
 
 class OpenAIInterface(BaseLLMInterface):
     """OpenAI模型接口"""
@@ -118,19 +127,20 @@ class OpenAIInterface(BaseLLMInterface):
         logger.warning(f"无法确定OpenAI模型 {self.model_name} 的嵌入维度，返回默认值1536")
         return 1536
 
+    def decode(self, tokens: List[int]) -> str:
+        """OpenAI API不直接支持从token ID解码"""
+        logger.warning("OpenAI API不直接支持从token ID解码，返回空字符串")
+        return "[Decode not supported for OpenAI API]"
+
 class LLMInterfaceFactory:
     """大模型接口工厂"""
     @staticmethod
-    def create_interface(interface_type: str, **kwargs) -> BaseLLMInterface:
+    def create_llm_interface(interface_type: str, **kwargs) -> BaseLLMInterface:
         # 从kwargs中安全地提取model_name
         model_name = kwargs.pop('model_name', None)
 
         if not model_name:
-            # 尝试从特定于类型的配置中获取model_name
-            if interface_type in kwargs and 'model_name' in kwargs[interface_type]:
-                model_name = kwargs[interface_type].get('model_name')
-            else:
-                raise ValueError("创建LLM接口时必须提供 'model_name'")
+            raise ValueError("创建LLM接口时必须提供 'model_name'")
 
         # 剩下的kwargs作为配置传递
         config = kwargs

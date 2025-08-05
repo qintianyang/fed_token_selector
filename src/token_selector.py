@@ -49,6 +49,9 @@ class TokenSelectorController(nn.Module):
         # 比特嵌入
         self.bit_embedding = nn.Embedding(2, hidden_dim // 4)  # 0或1
         
+        # 上下文token嵌入层
+        self.context_embedding = nn.Embedding(vocab_size, context_dim)
+        
         # 融合层
         self.fusion_layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
@@ -65,8 +68,7 @@ class TokenSelectorController(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, top_k),
-            nn.Softmax(dim=-1)
+            nn.Linear(hidden_dim // 2, top_k)
         )
         
         # 初始化权重
@@ -84,7 +86,7 @@ class TokenSelectorController(nn.Module):
     
     def forward(
         self,
-        context_embedding: torch.Tensor,  # [batch_size, context_dim]
+        context_embedding: torch.Tensor,  # [batch_size, context_dim] or [batch_size, seq_len] for token IDs
         top_k_logits: torch.Tensor,      # [batch_size, top_k]
         target_bit: torch.Tensor,        # [batch_size] 0或1
         top_k_indices: torch.Tensor      # [batch_size, top_k]
@@ -92,11 +94,27 @@ class TokenSelectorController(nn.Module):
         """
         前向传播
         
+        Args:
+            context_embedding: 上下文嵌入 [batch_size, context_dim] 或 token IDs [batch_size, seq_len]
+            top_k_logits: top-k logits [batch_size, top_k]
+            target_bit: 目标比特 [batch_size]
+            top_k_indices: top-k token索引 [batch_size, top_k]
+            
         Returns:
             selection_probs: [batch_size, top_k] - 在top_k中的选择概率
             selected_indices: [batch_size] - 选择的token在原vocab中的索引
         """
         batch_size = context_embedding.size(0)
+        
+        # 处理上下文输入：如果是token IDs则转换为嵌入
+        if context_embedding.dtype == torch.long:
+            # 输入是token IDs，需要转换为嵌入
+            if context_embedding.dim() == 2:  # [batch_size, seq_len]
+                # 对序列进行平均池化得到固定维度的表示
+                context_emb = self.context_embedding(context_embedding)  # [batch_size, seq_len, context_dim]
+                context_embedding = context_emb.mean(dim=1)  # [batch_size, context_dim]
+            else:  # [batch_size]
+                context_embedding = self.context_embedding(context_embedding)  # [batch_size, context_dim]
         
         # 编码各个输入
         context_encoded = self.context_encoder(context_embedding)  # [batch_size, hidden_dim]
@@ -116,17 +134,21 @@ class TokenSelectorController(nn.Module):
         
         # 输出选择概率
         fused_features = fused_features.squeeze(1)  # [batch_size, hidden_dim]
-        selection_probs = self.output_projection(fused_features)  # [batch_size, top_k]
+        selection_logits = self.output_projection(fused_features)  # [batch_size, top_k]
         
-        # 选择token
-        selected_top_k_idx = torch.multinomial(selection_probs, 1).squeeze(-1)  # [batch_size]
-        selected_indices = top_k_indices.gather(1, selected_top_k_idx.unsqueeze(1)).squeeze(1)
-        
-        return selection_probs, selected_indices
+        # 根据logits进行采样，得到在top_k中的索引
+        selection_probs = F.softmax(selection_logits, dim=-1)
+        selected_top_k_indices = torch.multinomial(selection_probs, 1).squeeze(-1) # [batch_size]
+
+        # 从top_k_indices中获取在词汇表中的真实索引
+        selected_indices = top_k_indices.gather(1, selected_top_k_indices.unsqueeze(-1)).squeeze(-1)
+
+        # 注意：这里返回logits，而不是probs
+        return selection_logits, selected_indices
     
     def get_watermark_loss(
         self,
-        selection_probs: torch.Tensor,
+        selection_logits: torch.Tensor, # 现在接收logits
         target_bit: torch.Tensor,
         green_mask: torch.Tensor
     ) -> torch.Tensor:
@@ -134,18 +156,25 @@ class TokenSelectorController(nn.Module):
         计算水印损失 - 鼓励选择绿名单token当target_bit=1
         
         Args:
-            selection_probs: [batch_size, top_k]
+            selection_logits: [batch_size, top_k] - 未经激活的logits
             target_bit: [batch_size]
             green_mask: [batch_size, top_k] - 绿名单mask
         """
-        # 绿名单概率
-        green_probs = (selection_probs * green_mask).sum(dim=-1)  # [batch_size]
+        # 我们需要计算“是绿色”这个事件的logit
+        # 这不是一个简单的线性操作，因为softmax不是线性的
+        # 一个近似方法是计算加权的logits，但这在数学上不完全正确
+        # 更简单和直接的方法是，我们把问题看作是对每个token是否应该被选择的二元分类
         
-        # 当target_bit=1时，希望green_probs高；target_bit=0时，希望green_probs低
+        # 为了使用BCEWithLogitsLoss，我们需要一个logit来表示“选择绿色”的概率
+        # 我们可以通过对绿区的logits进行聚合来得到这个值
+        # 例如，使用log-sum-exp技巧来稳定地计算softmax后的概率的log值
+        green_logits = selection_logits + (1.0 - green_mask.float()) * -1e9 # 用一个大负数mask掉非绿色的logits
+        green_prob_logit = torch.logsumexp(green_logits, dim=-1) # [batch_size]
+
         target_green_probs = target_bit.float()  # 转换为浮点数
         
-        # 使用BCE损失
-        watermark_loss = F.binary_cross_entropy(green_probs, target_green_probs)
+        # 使用BCEWithLogitsLoss
+        watermark_loss = F.binary_cross_entropy_with_logits(green_prob_logit, target_green_probs)
         
         return watermark_loss
     
@@ -169,27 +198,21 @@ class TokenSelectorController(nn.Module):
         )
         return semantic_loss
     
-    def get_fluency_loss(
-        self,
-        selection_probs: torch.Tensor,
-        top_k_logits: torch.Tensor
-    ) -> torch.Tensor:
+    def get_fluency_loss(self, selection_probs, top_k_probs, green_mask):
         """
-        计算流畅性损失 - 鼓励选择高概率token
-        
-        Args:
-            selection_probs: [batch_size, top_k]
-            top_k_logits: [batch_size, top_k]
+        计算流畅性损失，旨在惩罚模型选择非原始高概率词元。
         """
-        # 原始概率分布
-        original_probs = F.softmax(top_k_logits, dim=-1)
+        # 只在绿区token上计算期望概率
+        masked_selection_probs = selection_probs * green_mask
+        # 避免除以零
+        sum_selection_probs = masked_selection_probs.sum(dim=1, keepdim=True)
+        normalized_selection_probs = masked_selection_probs / (sum_selection_probs + 1e-10)
+
+        # 计算原始概率在绿区token上的期望值
+        expected_original_prob = (normalized_selection_probs * top_k_probs).sum(dim=1)
         
-        # 期望的原始概率（加权平均）
-        expected_original_prob = (selection_probs * original_probs).sum(dim=-1)
-        
-        # 鼓励选择高概率token
-        fluency_loss = -expected_original_prob.mean()
-        
+        # 流畅性损失：我们希望最大化这个期望，所以最小化它的负值
+        fluency_loss = 1 - expected_original_prob.mean()
         return fluency_loss
 
 

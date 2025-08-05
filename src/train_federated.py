@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset # 导入 Dataset
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 import logging
@@ -12,6 +12,7 @@ import os
 from token_selector import TokenSelectorController, WatermarkBitGenerator, GreenListGenerator
 from federated_framework import FederatedClient, FederatedServer, FedAvgAggregator
 from llm_interface import BaseLLMInterface, LLMInterfaceFactory
+from dataset import WatermarkDataset, collate_fn # 从新模块导入
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -140,148 +141,100 @@ class WatermarkDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
-def collate_fn(batch):
-    """数据批处理函数"""
-    # 找到最大序列长度
-    max_len = max(item['context_tokens'].size(0) for item in batch)
-    
-    # 填充序列
-    context_tokens = []
-    for item in batch:
-        tokens = item['context_tokens']
-        if tokens.size(0) < max_len:
-            # 使用0填充
-            padded = torch.cat([tokens, torch.zeros(max_len - tokens.size(0), dtype=tokens.dtype)])
-        else:
-            padded = tokens
-        context_tokens.append(padded)
-    
-    return {
-        'context_tokens': torch.stack(context_tokens),
-        'top_k_logits': torch.stack([item['top_p_logits'] for item in batch]),
-        'top_k_indices': torch.stack([item['top_p_indices'] for item in batch]),
-        'target_bit': torch.stack([item['target_bit'] for item in batch])
-    }
-
 class FederatedTrainer:
     """
     联邦学习训练器
     """
     
     def __init__(self, 
-                 config: Dict,
+                 config_manager, # 接收ConfigManager实例
                  num_clients: int = 5,
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-                 llm_config: Optional[Dict] = None,
-                 data_paths: Optional[List[str]] = None):
-        self.config = config
+                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+        self.config_manager = config_manager
+        self.config = config_manager.create_training_config_dict() # 保持扁平化配置用于本地
         self.num_clients = num_clients
         self.device = device
-        self.llm_config = llm_config or config.get('llm_config', {})
-        self.data_paths = data_paths
         
         # 动态获取context_dim
         context_dim = self._get_llm_embedding_dim()
         if context_dim is None:
-            context_dim = config.get('context_dim', 768) # Fallback
-            logger.warning(f"无法从LLM动态获取embedding_dim，使用默认值: {context_dim}")
+            # 安全地从配置中获取，如果不存在则使用默认值768
+            context_dim = self.config_manager.get('model.context_dim', 768) 
+            logger.warning(f"无法从LLM动态获取embedding_dim，使用回退值: {context_dim}")
 
         # 初始化全局模型
         self.global_model = TokenSelectorController(
-            vocab_size=config['vocab_size'],
+            vocab_size=self.config['vocab_size'],
             context_dim=context_dim, # 使用动态获取的维度
-            hidden_dim=config['hidden_dim'],
-            num_layers=config.get('num_layers', 3),
-            dropout=config.get('dropout', 0.1),
-            top_k=config.get('model', {}).get('max_candidate_tokens', 50) # 使用max_candidate_tokens
+            hidden_dim=self.config['hidden_dim'],
+            num_layers=self.config_manager.get('model.num_transformer_layers', 3),
+            dropout=self.config_manager.get('model.dropout', 0.1),
+            top_k=self.config_manager.get('model.max_candidate_tokens', 50)
         ).to(device)
         
         # 初始化联邦学习组件
-        self.aggregator = FedAvgAggregator()
+        self.clients = self._create_clients()
         self.server = FederatedServer(
             global_model=self.global_model,
-            aggregator=self.aggregator,
-            config=config
+            aggregator=FedAvgAggregator(),
+            config=self.config
         )
-        
-        # 初始化客户端
-        self.clients = []
-        for i in range(num_clients):
-            client_llm_interface = self._create_llm_interface_for_client(i)
-            
-            # 为每个客户端分配数据路径
-            client_data_path = None
-            if self.data_paths:
-                if len(self.data_paths) == 1:
-                    client_data_path = self.data_paths[0]  # 所有客户端使用相同的数据路径
-                elif i < len(self.data_paths):
-                    client_data_path = self.data_paths[i]
-
-            # 每个客户端有自己的数据集
-            dataset = WatermarkDataset(
-                config=self.config,
-                data_path=client_data_path,
-                llm_interface=client_llm_interface
-            )
-            
-            dataloader = DataLoader(
-                dataset, 
-                batch_size=config['batch_size'],
-                shuffle=True,
-                collate_fn=collate_fn
-            )
-            
-            client = FederatedClient(
-                client_id=i,
-                model=TokenSelectorController(
-                    vocab_size=self.config['vocab_size'],
-                    context_dim=self._get_llm_embedding_dim() or self.config['context_dim'],
-                    hidden_dim=self.config['hidden_dim'],
-                    num_layers=self.config.get('num_layers', 3),
-                    dropout=self.config.get('dropout', 0.1),
-                    top_k=self.config.get('model', {}).get('max_candidate_tokens', 50)
-                ).to(self.device),
-                local_data=dataloader,
-                config=self.config,
-                llm_interface=client_llm_interface
-            )
-            self.clients.append(client)
-
-    def _create_llm_interface_for_client(self, client_id: int) -> Optional[BaseLLMInterface]:
-        """为客户端创建LLM接口"""
-        if not self.llm_config.get('enabled', False):
-            return None
-        try:
-            interface_type = self.llm_config.get('type', 'huggingface')
-            interface = LLMInterfaceFactory.create_interface(interface_type, **self.llm_config)
-            logger.info(f"客户端 {client_id} 创建LLM接口成功")
-            return interface
-        except Exception as e:
-            logger.warning(f"客户端 {client_id} LLM接口创建失败: {e}")
-            return None
 
     def _get_llm_embedding_dim(self) -> Optional[int]:
-        """动态获取LLM的嵌入维度"""
-        if not self.llm_config.get('enabled', False):
+        """尝试从LLM获取embedding维度"""
+        # 使用第一个客户端的配置来获取LLM配置
+        clients = self.config_manager.get('federated.clients', [])
+        if not clients:
+            logger.error("没有找到客户端配置")
             return None
         
-        try:
-            interface_type = self.llm_config.get('type', 'huggingface')
-            temp_interface = LLMInterfaceFactory.create_interface(
-                interface_type,
-                **self.llm_config.get(interface_type, {})
-            )
-            if hasattr(temp_interface, 'get_embedding_dim'):
-                dim = temp_interface.get_embedding_dim()
-                logger.info(f"从 {interface_type} 接口动态获取的 embedding_dim: {dim}")
-                return dim
-            # 临时的接口使用后可以考虑销毁，如果它占用了大量资源
-            del temp_interface
-        except Exception as e:
-            logger.error(f"创建临时LLM接口以获取embedding_dim失败: {e}")
+        llm_config = clients[0].get('llm_config', {})
+        if llm_config.get('enabled', False):
+            try:
+                # 获取接口类型
+                interface_type = llm_config.get('type')
+                if not interface_type:
+                    logger.error("LLM配置中缺少type字段")
+                    return None
+                
+                # 获取对应类型的配置参数
+                type_config = llm_config.get(interface_type, {})
+                if not type_config:
+                    logger.error(f"LLM配置中缺少{interface_type}配置")
+                    return None
+                
+                # 创建LLM接口
+                llm_interface = LLMInterfaceFactory.create_llm_interface(interface_type, **type_config)
+                return llm_interface.get_embedding_dim()
+            except Exception as e:
+                logger.error(f"创建LLM接口或获取embedding_dim失败: {e}")
         return None
 
-    def train_round(self, round_num: int) -> Dict:
+    def _create_clients(self) -> List[FederatedClient]:
+        """创建联邦学习客户端"""
+        clients = []
+        client_configs = self.config_manager.get('federated.clients', [])
+        data_paths = self.config_manager.get('data_paths', [])
+
+        for i in range(self.num_clients):
+            client_config = client_configs[i] if i < len(client_configs) else {}
+            data_path = data_paths[i % len(data_paths)] if data_paths else None
+            
+            # 将顶层训练配置与客户端特定配置合并
+            merged_config = {**self.config, **client_config}
+
+            clients.append(
+                FederatedClient(
+                    client_id=i,
+                    model=self.global_model,
+                    data_path=data_path,
+                    config=merged_config, # 传递合并后的配置
+                    device=self.device
+                )
+            )
+        return clients
+
+    def train_round(self, round_num: int) -> Dict[str, float]:
         """执行一轮联邦训练"""
         logger.info(f"开始第 {round_num} 轮联邦训练")
         
@@ -294,21 +247,28 @@ class FederatedTrainer:
         client_metrics = []
         
         for client in self.clients:
-            # 本地训练
-            model_update = client.local_train(global_state)
+            # 更新客户端模型状态
+            client.model.load_state_dict(global_state)
+            
+            # 本地训练并获取统计信息
+            local_epochs = self.config_manager.get('training.local_epochs', 3)
+            training_stats = client.local_train(local_epochs)
+            
+            # 获取模型更新
+            model_update = client.get_model_parameters()
             client_updates.append(model_update)
             
             # 客户端权重（基于数据量）
-            client_weight = len(client.local_data.dataset)
+            client_weight = len(client.dataset)
             client_weights.append(client_weight)
             
-            # 获取训练统计
-            stats = client.get_training_stats()
+            # 使用返回的训练统计
+            local_epochs_for_metrics = self.config_manager.get('training.local_epochs', 10)
             client_metrics.append({
-                'loss': np.mean(stats['total_loss'][-client.local_epochs:]) if stats['total_loss'] else 0.0,
-                'watermark_loss': np.mean(stats['watermark_loss'][-client.local_epochs:]) if stats['watermark_loss'] else 0.0,
-                'semantic_loss': np.mean(stats['semantic_loss'][-client.local_epochs:]) if stats['semantic_loss'] else 0.0,
-                'fluency_loss': np.mean(stats['fluency_loss'][-client.local_epochs:]) if stats['fluency_loss'] else 0.0
+                'loss': np.mean(training_stats['total_loss'][-local_epochs_for_metrics:]) if training_stats['total_loss'] else 0.0,
+                'watermark_loss': np.mean(training_stats['watermark_loss'][-local_epochs_for_metrics:]) if training_stats['watermark_loss'] else 0.0,
+                'semantic_loss': np.mean(training_stats['semantic_loss'][-local_epochs_for_metrics:]) if training_stats['semantic_loss'] else 0.0,
+                'fluency_loss': np.mean(training_stats['fluency_loss'][-local_epochs_for_metrics:]) if training_stats['fluency_loss'] else 0.0
             })
         
         # 3. 聚合模型更新

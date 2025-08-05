@@ -126,11 +126,20 @@ class ConfigManager:
         """
         return self.get('training', {})
     
-    def get_federated_config(self) -> Dict[str, Any]:
-        """
-        获取联邦学习配置
-        """
+    def get_federated_config(self):
+        """获取联邦学习配置"""
         return self.get('federated', {})
+
+    def get_client_config(self, client_id: int) -> dict:
+        """获取指定客户端的配置"""
+        clients = self.get('federated.clients', [])
+        if client_id < len(clients):
+            return clients[client_id]
+        return {}
+
+    def get_training_config(self):
+        """获取训练配置"""
+        return self.get('training', {})
     
     def get_watermark_config(self) -> Dict[str, Any]:
         """

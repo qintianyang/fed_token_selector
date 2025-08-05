@@ -56,7 +56,7 @@ class WatermarkTextGenerator:
                 llm_config['config']['device'] = self.device
 
                 interface_type = llm_config.get('type', 'huggingface')
-                self.llm_interface = LLMInterfaceFactory.create_interface(
+                self.llm_interface = LLMInterfaceFactory.create_llm_interface(
                     interface_type, **llm_config
                 )
                 logger.info(f"文本生成器使用 {interface_type} 大模型接口，设备: {self.device}")
@@ -75,7 +75,8 @@ class WatermarkTextGenerator:
     def generate_text_with_watermark(self, 
                                    prompt_tokens: List[int],
                                    max_length: int = 50,
-                                   watermark_message: str = "SECRET",
+                                   watermark_message: Optional[str] = None,
+                                   watermark_bits: Optional[List[int]] = None,
                                    top_p: float = 0.92, 
                                    max_candidate_tokens: int = 50) -> Tuple[List[int], List[int]]:
         """
@@ -84,15 +85,22 @@ class WatermarkTextGenerator:
         Args:
             prompt_tokens: 初始prompt的token序列
             max_length: 最大生成长度
-            watermark_message: 要嵌入的水印消息
+            watermark_message: (可选) 要嵌入的水印消息字符串
+            watermark_bits: (可选) 要嵌入的水印比特序列，优先于message
             top_p: top-p采样参数
             max_candidate_tokens: top-p采样后的最大候选token数
             
         Returns:
             (生成的token序列, 嵌入的比特序列)
         """
-        # 将水印消息转换为比特序列
-        watermark_bits = self.bit_generator.message_to_bits(watermark_message)
+        # 优先使用watermark_bits，如果未提供，则从watermark_message生成
+        if watermark_bits is None:
+            if watermark_message:
+                watermark_bits = self.bit_generator.message_to_bits(watermark_message)
+            else:
+                watermark_bits = [] # 如果两者都未提供，则无水印
+
+        no_watermark = len(watermark_bits) == 0
         
         generated_tokens = prompt_tokens.copy()
         embedded_bits = []
@@ -109,26 +117,35 @@ class WatermarkTextGenerator:
                 top_p_logits, top_p_indices = self._nucleus_sampling(
                     logits, top_p, max_candidate_tokens
                 )
-                
-                # 获取当前要嵌入的比特
-                current_bit_idx = step % len(watermark_bits)
-                target_bit = torch.tensor([watermark_bits[current_bit_idx]]).long().to(self.device)
 
-                # 获取上下文嵌入
-                context_embedding = self._get_context_embedding(context_tokens)
+                if no_watermark:
+                    # 无水印模式：直接从候选token中随机选择
+                    # 为了保持与有水印情况下的输出分布相似，我们从top_p的结果中选择
+                    # 这里简单地选择概率最高的token
+                    selected_token = top_p_indices[0].item()
+                    embedded_bits.append(-1) # -1 表示没有嵌入比特
+                else:
+                    # 有水印模式：使用token选择器
+                    # 获取当前要嵌入的比特
+                    current_bit_idx = step % len(watermark_bits)
+                    target_bit = torch.tensor([watermark_bits[current_bit_idx]]).long().to(self.device)
+
+                    # 获取上下文嵌入
+                    context_embedding = self._get_context_embedding(context_tokens)
+                    
+                    # 使用token选择器选择token
+                    selection_probs, selected_indices = self.token_selector(
+                        context_embedding.unsqueeze(0),  # [1, context_dim]
+                        top_p_logits.unsqueeze(0),      # [1, max_candidate_tokens]
+                        target_bit,                     # [1]
+                        top_p_indices.unsqueeze(0)      # [1, max_candidate_tokens]
+                    )
+                    
+                    # 选择token
+                    selected_token = selected_indices[0].item()
+                    embedded_bits.append(watermark_bits[current_bit_idx])
                 
-                # 使用token选择器选择token
-                selection_probs, selected_indices = self.token_selector(
-                    context_embedding.unsqueeze(0),  # [1, context_dim]
-                    top_p_logits.unsqueeze(0),      # [1, max_candidate_tokens]
-                    target_bit,                     # [1]
-                    top_p_indices.unsqueeze(0)      # [1, max_candidate_tokens]
-                )
-                
-                # 选择token
-                selected_token = selected_indices[0].item()
                 generated_tokens.append(selected_token)
-                embedded_bits.append(watermark_bits[current_bit_idx])
                 
                 # 简单的停止条件（可以根据需要修改）
                 if selected_token == 0:  # 假设0是EOS token
